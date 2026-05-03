@@ -92,6 +92,24 @@ This project uses [uv](https://github.com/astral-sh/uv) for fast, reliable depen
     uv run pdf2epub_paddle.py --no-toc /path/to/your/book.pdf
     ```
 
+### Global Command Support
+
+You can run the tool from anywhere using the `epub` command:
+
+1. **Setup**: Create a symbolic link to the `epub` script in your PATH:
+
+    ```bash
+    sudo ln -s "$(pwd)/epub" /usr/local/bin/epub
+    ```
+
+2. **Usage**:
+
+    ```bash
+    epub /path/to/your/book.pdf
+    ```
+
+    The `epub` script automatically uses `uv run --project` to locate the correct environment regardless of your current directory.
+
 ### Alternative: Standard Pip
 
 If you prefer standard pip:

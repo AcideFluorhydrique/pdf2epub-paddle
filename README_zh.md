@@ -53,6 +53,24 @@
     uv run pdf2epub_paddle.py /path/to/your/book.pdf
     ```
 
+### 全局命令支持
+
+你可以通过创建符号链接在任何目录下使用 `epub` 命令：
+
+1. **设置**：
+
+    ```bash
+    sudo ln -s "$(pwd)/epub" /usr/local/bin/epub
+    ```
+
+2. **使用**：
+
+    ```bash
+    epub /path/to/your/book.pdf
+    ```
+
+    `epub` 脚本会自动使用 `uv run --project` 找到正确的运行环境。
+
 ### 替代方案：使用标准 Pip
 
 如果你更习惯使用标准 pip：
