@@ -269,20 +269,29 @@ def extract_metadata_interactive(
 
 def normalize_title(s: str) -> str:
     """Normalizes title string by stripping markdown markup, Roman numerals, and punctuation."""
-    s = re.sub(r"^#+\s*", "", s.strip())
-    s = re.sub(r"^[IVXLCDM0-9\.\s\-–—:]+", "", s, flags=re.I)
-    s = re.sub(r"[^a-zA-Z0-9\u4e00-\u9fa5]", "", s).lower()
-    return s
+    orig = re.sub(r"^#+\s*", "", s.strip())
+    s = re.sub(
+        r"^(?:Chapter|Part|Book|Section|Lecture|Volume|Act)\s+(?:[IVXLCDM\d]+[\.\s\-–—:/|]+|[A-Z]\b[\.\s\-–—:/|]+)",
+        "",
+        orig,
+        flags=re.I,
+    )
+    s = re.sub(r"^[IVXLCDM]+[\.\s\-–—:/|]+\s*", "", s, flags=re.I)
+    s = re.sub(r"^\d+[\.\s\-–—:/|]+\s*", "", s)
+    raw_s = re.sub(r"[^a-zA-Z0-9\u4e00-\u9fa5]", "", s).lower()
+    if not raw_s:
+        return re.sub(r"[^a-zA-Z0-9\u4e00-\u9fa5]", "", orig).lower()
+    return raw_s
 
 
 def is_major_chapter_title(title: str) -> bool:
     """Checks if a title represents a top-level major chapter."""
     clean = title.strip()
     clean = re.sub(r"^#+\s*", "", clean)
-    clean = re.sub(r"^\|?\d+\|?\s*", "", clean)
+    clean = re.sub(r"^\|\d+\|\s*", "", clean)
     return bool(
         re.match(
-            r"^(?:[IVXLCDM]+(?:\.|\b)|\b(?:Chapter|Part|Book|Section|Lecture|Preface|Introduction|Epilogue|Conclusion|Appendix|Index|Prologue|Foreword|Afterword)\b|第[零一二三四五六七八九十百千0-9]+[篇章节讲]|序|前言|导论|后记|附录|索引)",
+            r"^(?:[IVXLCDM]+(?:\.|\b)|\d+[\.\/](?:\s+|$)|(?:Chapter|Part|Book|Section|Lecture|Volume|Act)\s+[IVXLCDM\d]+|\b(?:Chapter|Part|Book|Section|Lecture|Preface|Introduction|Foreword|Epilogue|Conclusion|Appendix|Index|Prologue|Afterword|Notes|Bibliography)\b|第[零一二三四五六七八九十百千0-9]+[篇章节讲]|序|前言|导论|后记|附录|索引|参考文献|结语)",
             clean,
             re.I,
         )
@@ -306,17 +315,41 @@ def is_toc_page_num_line(line: str) -> bool:
     return True
 
 
+def clean_toc_line(line: str) -> str:
+    """Cleans a line from the printed Table of Contents."""
+    clean = line.strip()
+    clean = re.sub(r"^#+\s*", "", clean)
+    clean = re.sub(r"\$\s*\\underline\{(.+?)\}\s*\$", r"\1", clean).strip()
+    clean = re.sub(r"^\|\d+\|\s*", "", clean).strip()
+    clean = re.sub(r"^[-*•·]\s+", "", clean).strip()
+    clean = re.sub(r"\s+\d+$", "", clean).strip()
+    if not re.search(
+        r"\b(?:Part|Chapter|Book|Section|Volume|Act|No|Table)\s+[IVXLCDM\d]+$",
+        clean,
+        re.I,
+    ):
+        clean = re.sub(r"\s+[ivxlcdm]+$", "", clean, flags=re.I).strip()
+    return clean
+
+
+def is_notes_or_citations_block(lines: List[str]) -> bool:
+    """Detects if a block consists of numbered citation notes (e.g. 1. Author, Title)."""
+    citation_count = sum(bool(re.match(r"^\d+\.\s+[A-Z]", l.strip())) for l in lines)
+    return citation_count >= 3
+
+
 def extract_printed_toc(results: List[Dict]) -> Optional[List[Dict]]:
     """
     Tier 1: Detects and parses the printed Table of Contents (TOC) page in the front-matter
     and matches entries against the document body for exact split pages.
     """
     toc_entries = []
+    toc_block_ids = set()
     contents_pages = set()
 
     # 1. Search first 25 pages for printed Contents / Table of Contents / 目录 or dense page-number listings
     for p_idx, r in enumerate(results[:25]):
-        for res in r.get("result", {}).get("layoutParsingResults", []):
+        for res_idx, res in enumerate(r.get("result", {}).get("layoutParsingResults", [])):
             md = res["markdown"]["text"]
             lines = [l.strip() for l in md.split("\n") if l.strip()]
             has_contents_header = any(
@@ -336,58 +369,91 @@ def extract_printed_toc(results: List[Dict]) -> Optional[List[Dict]]:
 
             if has_contents_header or len(toc_like_lines) >= 3:
                 contents_pages.add(p_idx)
-                for line in lines:
+                toc_block_ids.add((p_idx, res_idx))
+                i = 0
+                while i < len(lines):
+                    raw_line = lines[i]
                     if re.match(
                         r"^#{1,3}\s*(?:Contents|Table of Contents|TABLE OF CONTENTS|目录|目\s*录)\b",
-                        line,
+                        raw_line,
                         re.I,
                     ):
+                        i += 1
                         continue
 
-                    # Check if line is a lowercase dangling continuation fragment
-                    if (
-                        toc_entries
-                        and not is_major_chapter_title(line)
-                        and re.match(r"^(?:and|or|of|in|to|with|for)\b", line)
-                        and is_toc_page_num_line(line)
-                    ):
-                        clean_line = re.sub(r"\s+\d+$", "", line).strip()
-                        toc_entries[-1]["title"] += " " + clean_line
-                        continue
-
-                    # TOC entries typically end with a page number or start with a major chapter identifier
-                    has_page_num = is_toc_page_num_line(line)
-                    is_major = is_major_chapter_title(line)
-
-                    if not (has_page_num or is_major):
-                        continue  # Skip epigraphs, poems, notes on TOC page
-
-                    clean = re.sub(r"\s+\d+$", "", line).strip()
-                    clean = re.sub(r"^#+\s*", "", clean)
-                    clean = re.sub(r"\$\s*\\underline\{(.+?)\}\s*\$", r"\1", clean).strip()
-                    clean = re.sub(r"^\|?\d+\|?\s*", "", clean).strip()
-                    clean = re.sub(r"\s+[ivxldcm\d]+$", "", clean, flags=re.I).strip()
-                    clean = (
-                        re.sub(r"^[-*•\d\.\s]+\s+", "", clean).strip()
-                        if clean.startswith(("-", "*", "•"))
-                        else clean
-                    )
-                    if len(clean) >= 3 and not clean.isdigit():
-                        is_major_clean = is_major_chapter_title(clean)
-                        toc_entries.append(
-                            {
-                                "title": clean,
-                                "is_major": is_major_clean,
-                                "level": 1 if is_major_clean else 2,
-                            }
+                    # Combine Part headers with subtitle: "## PART I" + "Meditation: Its Spirit"
+                    is_part_header = bool(
+                        re.match(
+                            r"^#*\s*(?:Part|Book|Section|Volume)\s+[IVXLCDM\d]+$",
+                            raw_line,
+                            re.I,
                         )
+                    )
+                    if is_part_header and i + 1 < len(lines):
+                        next_line = lines[i + 1]
+                        if (
+                            not is_toc_page_num_line(next_line)
+                            and not is_major_chapter_title(next_line)
+                            and len(next_line) >= 5
+                        ):
+                            raw_line = f"{raw_line}: {next_line}"
+                            i += 1
+                            if (
+                                i + 1 < len(lines)
+                                and not is_toc_page_num_line(lines[i + 1])
+                                and not is_major_chapter_title(lines[i + 1])
+                            ):
+                                i += 1
+
+                    # Split concatenated entries like "4. The Way 90 Epilogue 131"
+                    m_multi = re.search(
+                        r"([a-zA-Z\.\)]\s+)(\d{1,4})\s+([A-Z][a-zA-Z\s\–\—\-\:\,\'\"]+?\s+\d{1,4})$",
+                        raw_line,
+                    )
+                    if m_multi:
+                        sub_lines = [
+                            raw_line[: m_multi.start(2) + len(m_multi.group(2))],
+                            m_multi.group(3),
+                        ]
+                    else:
+                        sub_lines = [raw_line]
+
+                    for line in sub_lines:
+                        # Check if line is a lowercase dangling continuation fragment
+                        if (
+                            toc_entries
+                            and not is_major_chapter_title(line)
+                            and re.match(r"^(?:and|or|of|in|to|with|for)\b", line)
+                            and is_toc_page_num_line(line)
+                        ):
+                            clean_line = re.sub(r"\s+\d+$", "", line).strip()
+                            toc_entries[-1]["title"] += " " + clean_line
+                            continue
+
+                        has_page_num = is_toc_page_num_line(line)
+                        is_major = is_major_chapter_title(line)
+
+                        if not (has_page_num or is_major):
+                            continue
+
+                        clean = clean_toc_line(line)
+                        if len(clean) >= 3 and not clean.isdigit():
+                            is_major_clean = is_major_chapter_title(clean)
+                            toc_entries.append(
+                                {
+                                    "title": clean,
+                                    "is_major": is_major_clean,
+                                    "level": 1 if is_major_clean else 2,
+                                }
+                            )
+                    i += 1
 
     if len(toc_entries) < 3:
         return None
 
     # 2. Match each entry to body pages
     matched = []
-    start_search_page = max(contents_pages) + 1 if contents_pages else 0
+    start_search_page = min(contents_pages) if contents_pages else 0
     last_page = start_search_page
 
     for entry in toc_entries:
@@ -398,38 +464,85 @@ def extract_printed_toc(results: List[Dict]) -> Optional[List[Dict]]:
         best_page = 0
         best_match_text = None
 
+        is_back_matter_entry = bool(
+            re.search(
+                r"\b(?:Notes|Bibliography|References|Index|Appendix|后记|附录|索引|参考文献)\b",
+                entry["title"],
+                re.I,
+            )
+        )
+
         search_start = max(start_search_page, last_page - 1)
         for p_idx in range(search_start, len(results)):
-            for res in results[p_idx].get("result", {}).get("layoutParsingResults", []):
+            found_strong_header = False
+            for res_idx, res in enumerate(
+                results[p_idx].get("result", {}).get("layoutParsingResults", [])
+            ):
+                if (p_idx, res_idx) in toc_block_ids:
+                    continue
+
                 page_md = res["markdown"]["text"]
-                for line in page_md.split("\n"):
+                lines = page_md.split("\n")
+
+                # Skip citation/notes blocks unless this TOC entry is actually Notes/References
+                if not is_back_matter_entry and is_notes_or_citations_block(lines):
+                    continue
+
+                for line in lines:
                     line_clean = line.strip()
-                    # Protect against matching within long paragraphs
-                    if not line_clean or (
-                        len(line_clean) > 80 and not line_clean.startswith("#")
-                    ):
+                    if not line_clean:
+                        continue
+                    is_header = line_clean.startswith("#")
+                    if not is_header and len(line_clean) > 80:
                         continue
                     line_norm = normalize_title(line_clean)
                     if not line_norm:
                         continue
 
-                    ratio = SequenceMatcher(None, target, line_norm).ratio()
-                    if ratio > 0.8 or (
-                        len(target) >= 6
-                        and (
-                            line_norm.startswith(target)
-                            or target.startswith(line_norm)
-                        )
+                    # Exact full match check
+                    raw_clean = re.sub(
+                        r"[^a-zA-Z0-9\u4e00-\u9fa5]", "", line_clean
+                    ).lower()
+                    raw_entry = re.sub(
+                        r"[^a-zA-Z0-9\u4e00-\u9fa5]", "", entry["title"]
+                    ).lower()
+
+                    if raw_clean == raw_entry or (
+                        len(raw_clean) >= 12
+                        and len(raw_entry) >= 12
+                        and (raw_clean in raw_entry or raw_entry in raw_clean)
                     ):
-                        score = ratio + (0.4 if line_clean.startswith("#") else 0)
-                        if score > best_score:
-                            best_score = score
-                            best_match_text = line_clean
-                            best_page = p_idx + 1
-                            if best_score >= 1.2:
-                                break
-                if best_score >= 1.2:
+                        score = 2.0
+                    else:
+                        ratio = SequenceMatcher(None, target, line_norm).ratio()
+                        if is_header:
+                            if ratio > 0.8 or (
+                                len(target) >= 6
+                                and (
+                                    line_norm.startswith(target)
+                                    or target.startswith(line_norm)
+                                )
+                            ):
+                                score = ratio + 0.5
+                            else:
+                                score = 0
+                        else:
+                            if ratio > 0.88:
+                                score = ratio
+                            else:
+                                score = 0
+
+                    if score > best_score:
+                        best_score = score
+                        best_match_text = line_clean
+                        best_page = p_idx + 1
+                        if is_header and best_score >= 1.4:
+                            found_strong_header = True
+                            break
+                if found_strong_header:
                     break
+            if found_strong_header:
+                break
 
         if best_page > 0 and best_score >= 0.8:
             last_page = max(last_page, best_page)
@@ -676,29 +789,60 @@ def review_toc_interactive(
 
 
 def find_matching_heading(
-    line_text: str, confirmed_headings: List[Dict]
-) -> Optional[Dict]:
-    """Finds if a line matches any of the confirmed headings via fuzzy comparison."""
-    # 1. First try exact match on full string (including Roman numerals / chapter numbers)
-    raw_line = re.sub(r"[^a-zA-Z0-9\u4e00-\u9fa5]", "", line_text).lower()
-    if raw_line:
-        for h in confirmed_headings:
-            raw_h = re.sub(r"[^a-zA-Z0-9\u4e00-\u9fa5]", "", h["title"]).lower()
-            if raw_line == raw_h:
-                return h
+    line_text: str,
+    confirmed_headings: List[Dict],
+    start_idx: int = 0,
+    lookahead_count: int = 2,
+    current_page: int = 0,
+) -> tuple[Optional[Dict], int]:
+    """
+    Finds if a line matches any of the expected upcoming confirmed headings
+    in sequential order. Returns (matched_heading, next_heading_idx).
+    """
+    clean_line = line_text.strip()
+    if not clean_line or is_toc_page_num_line(clean_line):
+        return None, start_idx
 
-    # 2. Fallback to normalized title matching (ignoring Roman numerals/formatting)
-    norm_line = normalize_title(line_text)
-    if not norm_line:
-        return None
-    for h in confirmed_headings:
-        norm_h = normalize_title(h["title"])
-        if norm_line == norm_h or (
-            len(norm_line) >= 5
-            and SequenceMatcher(None, norm_line, norm_h).ratio() > 0.85
+    h_text = re.sub(r"^#+\s*", "", clean_line)
+    h_text = re.sub(r"\$\s*\\underline\{(.+?)\}\s*\$", "", h_text).strip()
+    h_text = re.sub(r"^\d+\s+", "", h_text).strip()
+
+    raw_line = re.sub(r"[^a-zA-Z0-9\u4e00-\u9fa5]", "", h_text).lower()
+    norm_line = normalize_title(h_text)
+
+    search_limit = min(start_idx + lookahead_count, len(confirmed_headings))
+    for idx in range(start_idx, search_limit):
+        target_h = confirmed_headings[idx]
+        if current_page > 0 and current_page < target_h.get("page", 0) - 1:
+            continue
+
+        raw_h = re.sub(r"[^a-zA-Z0-9\u4e00-\u9fa5]", "", target_h["title"]).lower()
+        norm_h = normalize_title(target_h["title"])
+
+        matched = False
+        if target_h.get("matched_text") and clean_line == target_h["matched_text"].strip():
+            matched = True
+        elif raw_line == raw_h or (
+            len(raw_line) >= 12 and (raw_line in raw_h or raw_h in raw_line)
         ):
-            return h
-    return None
+            matched = True
+        elif (
+            clean_line.startswith("#")
+            and norm_line
+            and (
+                norm_line == norm_h
+                or (
+                    len(norm_line) >= 5
+                    and SequenceMatcher(None, norm_line, norm_h).ratio() > 0.8
+                )
+            )
+        ):
+            matched = True
+
+        if matched:
+            return target_h, idx + 1
+
+    return None, start_idx
 
 
 def download_image(url: str, save_path: str, max_retries: int = 3) -> bool:
@@ -788,6 +932,7 @@ def create_epub(
     book.add_item(nav_css)
 
     full_markdown = ""
+    global_page_counter = 0
 
     for chunk_idx, result in enumerate(results):
         if not result or "result" not in result:
@@ -796,6 +941,7 @@ def create_epub(
         layout_results = result["result"].get("layoutParsingResults", [])
 
         for i, page_res in enumerate(layout_results):
+            global_page_counter += 1
             page_md = page_res["markdown"]["text"]
             images_map = page_res["markdown"].get("images", {})
 
@@ -862,12 +1008,16 @@ def create_epub(
             if current_para:
                 reflowed_paragraphs.append(current_para)
 
-            page_markdown = "\n\n".join(reflowed_paragraphs)
+            page_markdown = f"<!-- page: {global_page_counter} -->\n" + "\n\n".join(
+                reflowed_paragraphs
+            )
 
             if full_markdown and page_markdown:
                 full_stripped = full_markdown.rstrip()
                 page_lines = page_markdown.split("\n")
-                first_page_line = page_lines[0].strip() if page_lines else ""
+                first_page_line = (
+                    page_lines[1].strip() if len(page_lines) > 1 else ""
+                )
 
                 ends_mid_sentence = full_stripped and not full_stripped.endswith(
                     terminal_chars
@@ -878,7 +1028,7 @@ def create_epub(
 
                 if ends_mid_sentence and not next_is_header:
                     full_markdown = (
-                        full_markdown.rstrip() + " " + page_markdown + "\n\n"
+                        full_markdown.rstrip() + "\n" + page_markdown + "\n\n"
                     )
                 else:
                     full_markdown += page_markdown + "\n\n"
@@ -889,6 +1039,8 @@ def create_epub(
     current_chapter_title = "Start"
     current_chapter_content = []
     chapter_count = 0
+    next_heading_idx = 0
+    current_page = 0
 
     major_header_pattern = re.compile(
         r"^(#{1,3})\s+(?:Chapter|Part|Lecture|Preface|Intro|Appendix|Prologue|Epilogue|Conclusion|Book|Acknowledgements|Contents|Abstract|序|前言|导论|目录|第[零一二三四五六七八九十百千0-9]+[篇章讲]).*"
@@ -896,33 +1048,43 @@ def create_epub(
     any_header_pattern = re.compile(r"^(#{1,3})\s+(.+)$")
 
     for line in md_lines:
+        if line.startswith("<!-- page: "):
+            m_pg = re.search(r"<!-- page:\s*(\d+)\s*-->", line)
+            if m_pg:
+                current_page = int(m_pg.group(1))
+            continue
+
         match = any_header_pattern.match(line)
         is_split_point = False
         clean_matched_title = None
 
-        if match:
+        if confirmed_headings is not None:
+            matched_h, next_idx = find_matching_heading(
+                line,
+                confirmed_headings,
+                start_idx=next_heading_idx,
+                current_page=current_page,
+            )
+            if matched_h:
+                clean_matched_title = matched_h["title"]
+                if clean_matched_title != current_chapter_title:
+                    is_split_point = True
+                    next_heading_idx = next_idx
+        elif match:
             heading_text = match.group(2).strip()
             heading_text = re.sub(
                 r"\$\s*\\underline\{(.+?)\}\s*\$", "", heading_text
             ).strip()
             heading_text = re.sub(r"^\d+\s+", "", heading_text).strip()
-
-            if confirmed_headings is not None:
-                matched_h = find_matching_heading(heading_text, confirmed_headings)
-                if matched_h:
-                    clean_matched_title = matched_h["title"]
-                    if clean_matched_title != current_chapter_title:
-                        is_split_point = True
-            else:
-                is_split_point = bool(major_header_pattern.match(line))
-                if is_split_point:
-                    clean_matched_title = heading_text
+            is_split_point = bool(major_header_pattern.match(line))
+            if is_split_point:
+                clean_matched_title = heading_text
 
         # Clean up LaTeX artifacts
         line = re.sub(r"\$\s*\^\{(.+?)\}\s*\$", r"", line)
         line = re.sub(r"\$\s*\\underline\{(.+?)\}\s*\$", "", line)
 
-        if match and is_split_point:
+        if is_split_point:
             # Check if previous chapter has meaningful content before saving
             content_text = "".join(current_chapter_content).strip()
             if current_chapter_content and len(content_text) > 30:
