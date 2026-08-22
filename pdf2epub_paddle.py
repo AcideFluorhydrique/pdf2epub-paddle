@@ -6,7 +6,9 @@ import json
 import re
 import tempfile
 import time
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
+from collections import Counter
+from difflib import SequenceMatcher
 
 import requests
 import fitz  # PyMuPDF
@@ -261,12 +263,161 @@ def extract_metadata_interactive(
     return {"title": title, "author": author if author else None}
 
 
-def extract_candidate_headings(results: List[Dict]) -> List[Dict]:
-    """Scans API results and extracts candidate chapter headings with page numbers."""
-    candidates = []
-    any_header_pattern = re.compile(r"^(#{1,2})\s+(.+)$")
+# ==========================================
+# --- Smart Table of Contents (TOC) Engine ---
+# ==========================================
+
+def normalize_title(s: str) -> str:
+    """Normalizes title string by stripping markdown markup, Roman numerals, and punctuation."""
+    s = re.sub(r"^#+\s*", "", s.strip())
+    s = re.sub(r"^[IVXLCDM0-9\.\s\-–—:]+", "", s, flags=re.I)
+    s = re.sub(r"[^a-zA-Z0-9\u4e00-\u9fa5]", "", s).lower()
+    return s
+
+
+def is_major_chapter_title(title: str) -> bool:
+    """Checks if a title represents a top-level major chapter."""
+    clean = title.strip()
+    return bool(
+        re.match(
+            r"^(?:[IVXLCDM]+(?:\.|\b)|\b(?:Chapter|Part|Book|Section|Lecture|Preface|Introduction|Epilogue|Conclusion|Appendix|Index|Prologue|Foreword|Afterword)\b|第[零一二三四五六七八九十百千0-9]+[篇章节讲]|序|前言|导论|后记|附录|索引)",
+            clean,
+            re.I,
+        )
+    )
+
+
+def extract_printed_toc(results: List[Dict]) -> Optional[List[Dict]]:
+    """
+    Tier 1: Detects and parses the printed Table of Contents (TOC) page in the front-matter
+    and matches entries against the document body for exact split pages.
+    """
+    toc_entries = []
+    contents_pages = set()
+
+    # 1. Search first 25 pages for printed Contents / Table of Contents / 目录
+    for p_idx, r in enumerate(results[:25]):
+        for res in r.get("result", {}).get("layoutParsingResults", []):
+            md = res["markdown"]["text"]
+            lines = [l.strip() for l in md.split("\n") if l.strip()]
+            has_contents_header = any(
+                re.match(
+                    r"^#{1,3}\s*(?:Contents|Table of Contents|TABLE OF CONTENTS|目录|目\s*录)\b",
+                    l,
+                    re.I,
+                )
+                for l in lines
+            )
+            if has_contents_header:
+                contents_pages.add(p_idx)
+                for line in lines:
+                    if re.match(
+                        r"^#{1,3}\s*(?:Contents|Table of Contents|TABLE OF CONTENTS|目录|目\s*录)\b",
+                        line,
+                        re.I,
+                    ):
+                        continue
+
+                    # TOC entries typically end with a page number or start with a major chapter identifier
+                    has_page_num = bool(re.search(r"\s+\d+$", line))
+                    is_major = is_major_chapter_title(line)
+
+                    if not (has_page_num or is_major):
+                        continue  # Skip epigraphs, poems, notes on TOC page
+
+                    clean = re.sub(r"\s+\d+$", "", line).strip()
+                    clean = re.sub(r"\$\s*\\underline\{(.+?)\}\s*\$", r"\1", clean).strip()
+                    clean = (
+                        re.sub(r"^[-*•\d\.\s]+\s+", "", clean).strip()
+                        if clean.startswith(("-", "*", "•"))
+                        else clean
+                    )
+                    if len(clean) >= 3 and not clean.isdigit():
+                        toc_entries.append(
+                            {
+                                "title": clean,
+                                "is_major": is_major,
+                                "level": 1 if is_major else 2,
+                            }
+                        )
+
+    if len(toc_entries) < 3:
+        return None
+
+    # 2. Match each entry to body pages
+    matched = []
+    start_search_page = max(contents_pages) + 1 if contents_pages else 0
+    last_page = start_search_page
+
+    for entry in toc_entries:
+        target = normalize_title(entry["title"])
+        if not target:
+            continue
+        best_score = 0
+        best_page = 0
+        best_match_text = None
+
+        search_start = max(start_search_page, last_page - 1)
+        for p_idx in range(search_start, len(results)):
+            for res in results[p_idx].get("result", {}).get("layoutParsingResults", []):
+                page_md = res["markdown"]["text"]
+                for line in page_md.split("\n"):
+                    line_clean = line.strip()
+                    if not line_clean:
+                        continue
+                    line_norm = normalize_title(line_clean)
+                    if not line_norm:
+                        continue
+
+                    ratio = SequenceMatcher(None, target, line_norm).ratio()
+                    if target in line_norm or ratio > 0.8:
+                        score = ratio + (0.3 if line_clean.startswith("#") else 0)
+                        if score > best_score:
+                            best_score = score
+                            best_match_text = line_clean
+                            best_page = p_idx + 1
+                            if best_score >= 1.2:
+                                break
+            if best_score >= 1.2:
+                break
+
+        if best_page > 0 and best_score >= 0.8:
+            last_page = max(last_page, best_page)
+            matched.append(
+                {
+                    "title": entry["title"],
+                    "page": best_page,
+                    "level": entry["level"],
+                    "is_major": entry["is_major"],
+                    "matched_text": best_match_text,
+                }
+            )
+
+    return matched if len(matched) >= 3 else None
+
+
+def extract_and_filter_body_headings(
+    results: List[Dict], book_title: Optional[str] = None
+) -> List[Dict]:
+    """
+    Tier 2 Fallback: Scans document body for headings with intelligent filtering
+    against repeating running headers, publisher noise, and generic templates.
+    """
+    any_header_pattern = re.compile(r"^(#{1,3})\s+(.+)$")
     latex_pattern = re.compile(r"\$\s*\\underline\{(.+?)\}\s*\$")
+    candidates = []
     global_page = 0
+
+    # Publisher / front-matter blacklist
+    noise_patterns = re.compile(
+        r"^(?:PENGUIN BOOKS|HARPERCOLLINS|ROUTLEDGE|SPRINGER|OXFORD UNIVERSITY PRESS|"
+        r"CAMBRIDGE UNIVERSITY PRESS|SIMON & SCHUSTER|VINTAGE|MACMILLAN|WILEY|"
+        r"Contents|Table of Contents|TABLE OF CONTENTS|目录|目\s*录|"
+        r"ISBN\b|Copyright\b|All rights reserved|Printed in|Published by)\b",
+        re.I,
+    )
+
+    norm_book_title = normalize_title(book_title) if book_title else ""
 
     for result in results:
         if not result or "result" not in result:
@@ -280,10 +431,12 @@ def extract_candidate_headings(results: List[Dict]) -> List[Dict]:
                 match = any_header_pattern.match(line)
                 if match:
                     title = match.group(2).strip()
-                    # Clean LaTeX artifacts (e.g. "$ \underline{3} $ Title" -> "Title")
                     title = latex_pattern.sub("", title).strip()
-                    # Strip leading bare numbers left after LaTeX cleanup (e.g. "3 What Is..." -> "What Is...")
                     title = re.sub(r"^\d+\s+", "", title).strip()
+
+                    if len(title) < 3 or noise_patterns.match(title):
+                        continue
+
                     candidates.append(
                         {
                             "title": title,
@@ -292,99 +445,148 @@ def extract_candidate_headings(results: List[Dict]) -> List[Dict]:
                             "md_line": line,
                         }
                     )
-    return candidates
+
+    if not candidates:
+        return []
+
+    # Count frequencies of normalized titles to identify running headers
+    title_counts = Counter(normalize_title(c["title"]) for c in candidates)
+
+    filtered = []
+    for c in candidates:
+        norm = normalize_title(c["title"])
+        # Filter if repeated >= 2 times (running header or repeating template)
+        if title_counts[norm] >= 2:
+            continue
+        # Filter if matches book title
+        if norm_book_title and norm == norm_book_title:
+            continue
+        # Filter front-matter noise on first 4 pages
+        if c["page"] <= 4 and (len(c["title"]) > 60 or noise_patterns.search(c["title"])):
+            continue
+
+        is_major = is_major_chapter_title(c["title"]) or c["level"] == 1
+        filtered.append(
+            {
+                "title": c["title"],
+                "page": c["page"],
+                "level": 1 if is_major else 2,
+                "is_major": is_major,
+            }
+        )
+
+    return filtered
 
 
-def filter_heading_candidates(candidates: List[Dict]) -> List[Dict]:
-    """Adaptively filters headings by trying H1-only, then keyword match, then all."""
-    chapter_keyword = re.compile(
-        r"^(?:Chapter|Part|Lecture|Preface|Intro|Appendix|Prologue|Epilogue|"
-        r"Conclusion|Acknowledgements|Contents|Abstract|序|前言|导论|目录|附录|后记|"
-        r"第[零一二三四五六七八九十百千0-9]+[篇章节讲])",
-        re.IGNORECASE,
-    )
+def detect_chapter_headings(
+    results: List[Dict], book_title: Optional[str] = None
+) -> Tuple[List[Dict], List[Dict], str]:
+    """
+    Dual-Tier TOC Engine:
+    1. Tries to extract the printed Table of Contents from front-matter.
+    2. Falls back to body scanning with noise suppression.
+    Returns (major_headings, all_headings, source_str).
+    """
+    # Tier 1: Printed TOC
+    printed_matched = extract_printed_toc(results)
+    if printed_matched:
+        major = [h for h in printed_matched if h["is_major"]]
+        if len(major) < 2:
+            major = printed_matched
+        return major, printed_matched, "Printed Table of Contents"
 
-    # Strategy 1: H1-only (skip front-matter on first 2 pages)
-    h1 = [h for h in candidates if h["level"] == 1 and h["page"] > 2]
-    if len(h1) >= 4:
-        return h1
-
-    # Strategy 2: Keyword-matched headings (any level)
-    keyword_matches = [h for h in candidates if chapter_keyword.match(h["title"])]
-    if len(keyword_matches) >= 3:
-        return keyword_matches
-
-    # Strategy 3: All headings (last resort)
-    return candidates
+    # Tier 2: Body scanning fallback
+    body_headings = extract_and_filter_body_headings(results, book_title)
+    major = [h for h in body_headings if h["is_major"]]
+    if len(major) < 3:
+        major = body_headings
+    return major, body_headings, "Body Heading Scanner"
 
 
 def review_toc_interactive(
-    candidates: List[Dict], all_candidates: Optional[List[Dict]] = None
+    major_headings: List[Dict],
+    all_headings: List[Dict],
+    source: str = "Printed Table of Contents",
 ) -> List[Dict]:
-    """Interactive prompt for reviewing and editing the auto-detected TOC."""
-    if not candidates:
-        print("\n[!] No chapter headings detected. The book will be a single chapter.")
-        return []
+    """
+    Interactive prompt for reviewing and editing the detected TOC.
+    Offers major chapters as default and sub-sections via 'all'.
+    """
+    has_subsections = len(all_headings) > len(major_headings)
+    active_headings = list(major_headings)
+    viewing_all = False
 
     def _print_heading_list(headings):
-        print(f"  {'#':>3}  | {'Pg':>4} | Heading")
-        print(f"  {'---':>3}--+------+{'-' * 40}")
+        print(f"  {'#':>3}  | {'Pg':>4} | Level | Heading")
+        print(f"  {'---':>3}--+------+-------+{'-' * 44}")
         for i, h in enumerate(headings):
-            indent = "  " if h["level"] == 1 else "    "
-            print(f"  {i+1:>3}  | {h['page']:>4} | {indent}{h['title']}")
+            lvl_str = "H1" if h["level"] == 1 else "  H2"
+            indent = "" if h["level"] == 1 else "  "
+            print(f"  {i+1:>3}  | {h['page']:>4} |  {lvl_str}  | {indent}{h['title']}")
 
     def _show_options():
         print()
         print("Options:")
-        print("  [Enter]    Accept all headings as chapter split points")
+        if has_subsections and not viewing_all:
+            print(
+                f"  [Enter]    Accept Major Chapters only ({len(major_headings)} chapters)"
+            )
+            print(
+                f"  all        Show ALL {len(all_headings)} chapters and sub-sections"
+            )
+        else:
+            print(f"  [Enter]    Accept current list ({len(active_headings)} chapters)")
+            if has_subsections and viewing_all:
+                print(f"  major      Show only Major Chapters ({len(major_headings)} chapters)")
+
         print("  1,3,5      Remove headings by number (comma-separated)")
         print("  +1,3,5     Keep ONLY these headings (comma-separated)")
-        if all_candidates and len(all_candidates) > len(candidates):
-            print(
-                f"  all        Show all {len(all_candidates)} headings (including sub-sections)"
-            )
         print("  none       No chapters (entire book as single chapter)")
         print()
 
-    print("\n--- Detected Chapter Headings ---")
-    _print_heading_list(candidates)
+    print(
+        f"\n--- Detected Chapter Headings (Source: {source} | {len(major_headings)} Major Chapters, {len(all_headings)} Total) ---"
+    )
+    _print_heading_list(active_headings)
     _show_options()
 
     while True:
         choice = input("Your choice: ").strip()
 
         if choice == "":
-            return list(candidates)
+            return list(active_headings)
         elif choice.lower() == "none":
             return []
-        elif (
-            choice.lower() == "all"
-            and all_candidates
-            and len(all_candidates) > len(candidates)
-        ):
-            candidates = all_candidates
-            all_candidates = None
-            print(f"\n--- All Headings ({len(candidates)}) ---")
-            _print_heading_list(candidates)
+        elif choice.lower() == "all" and has_subsections and not viewing_all:
+            active_headings = list(all_headings)
+            viewing_all = True
+            print(f"\n--- All Headings ({len(active_headings)} chapters & sub-sections) ---")
+            _print_heading_list(active_headings)
+            _show_options()
+            continue
+        elif choice.lower() == "major" and has_subsections and viewing_all:
+            active_headings = list(major_headings)
+            viewing_all = False
+            print(f"\n--- Major Chapters ({len(active_headings)}) ---")
+            _print_heading_list(active_headings)
             _show_options()
             continue
         else:
             try:
-                # Detect keep mode (+) vs remove mode (default)
                 keep_mode = choice.startswith("+")
                 if keep_mode:
-                    choice = choice[1:]  # strip the +
+                    choice = choice[1:]
 
                 nums = set()
                 valid = True
                 for part in choice.split(","):
-                    part = part.strip().lstrip("-")  # allow optional - prefix
+                    part = part.strip().lstrip("-")
                     num = int(part)
-                    if 1 <= num <= len(candidates):
+                    if 1 <= num <= len(active_headings):
                         nums.add(num)
                     else:
                         print(
-                            f"  [!] Invalid number: {num} (must be 1-{len(candidates)})"
+                            f"  [!] Invalid number: {num} (must be 1-{len(active_headings)})"
                         )
                         valid = False
                         break
@@ -394,35 +596,50 @@ def review_toc_interactive(
 
                 if keep_mode:
                     confirmed = [
-                        h for i, h in enumerate(candidates) if (i + 1) in nums
+                        h for i, h in enumerate(active_headings) if (i + 1) in nums
                     ]
                 else:
                     confirmed = [
-                        h for i, h in enumerate(candidates) if (i + 1) not in nums
+                        h for i, h in enumerate(active_headings) if (i + 1) not in nums
                     ]
 
                 if confirmed:
                     print(f"\nUpdated TOC ({len(confirmed)} chapters):")
                     _print_heading_list(confirmed)
                 else:
-                    print(
-                        "\n  All headings removed. Book will be a single chapter."
-                    )
+                    print("\n  All headings removed. Book will be a single chapter.")
 
                 confirm = input("\nConfirm? [Y/n]: ").strip().lower()
                 if confirm in ("", "y", "yes"):
                     return confirmed
                 else:
-                    print("\n--- Detected Chapter Headings ---")
-                    _print_heading_list(candidates)
+                    print("\n--- Current Chapter Headings ---")
+                    _print_heading_list(active_headings)
                     _show_options()
                     continue
 
             except ValueError:
                 print(
-                    "  [!] Invalid input. Use numbers like '1,3,5' or '+1,3,5' for keep mode."
+                    "  [!] Invalid input. Use numbers like '1,3,5' or '+1,3,5' for keep mode, or 'all'/'major'."
                 )
                 continue
+
+
+def find_matching_heading(
+    line_text: str, confirmed_headings: List[Dict]
+) -> Optional[Dict]:
+    """Finds if a line matches any of the confirmed headings via normalized fuzzy comparison."""
+    norm_line = normalize_title(line_text)
+    if not norm_line:
+        return None
+    for h in confirmed_headings:
+        norm_h = normalize_title(h["title"])
+        if norm_line == norm_h or (
+            len(norm_line) >= 5
+            and SequenceMatcher(None, norm_line, norm_h).ratio() > 0.85
+        ):
+            return h
+    return None
 
 
 def download_image(url: str, save_path: str, max_retries: int = 3) -> bool:
@@ -444,7 +661,7 @@ def download_image(url: str, save_path: str, max_retries: int = 3) -> bool:
                 f"[!] Image download failed (attempt {attempt + 1}/{max_retries}): {os.path.basename(save_path)} - {e}"
             )
         if attempt < max_retries - 1:
-            wait = 2**attempt * 2  # 2s, 4s, 8s
+            wait = 2**attempt * 2
             print(f"    Retrying in {wait}s...")
             time.sleep(wait)
     print(f"[!] PERMANENT FAILURE downloading: {os.path.basename(save_path)}")
@@ -452,10 +669,7 @@ def download_image(url: str, save_path: str, max_retries: int = 3) -> bool:
 
 
 def verify_all_images_downloaded(results: List[Dict], image_dir: str) -> tuple:
-    """Verifies all API-referenced images exist on disk.
-    Returns (total_count, missing_list) where missing_list contains
-    (rel_path, url) tuples for images that failed to download.
-    """
+    """Verifies all API-referenced images exist on disk."""
     total = 0
     missing = []
     for result in results:
@@ -618,75 +832,78 @@ def create_epub(
     chapter_count = 0
 
     major_header_pattern = re.compile(
-        r"^(#{1,2})\s+(?:Chapter|Part|Lecture|Preface|Intro|Appendix|Prologue|Epilogue|Conclusion|Book|Acknowledgements|Contents|Abstract|序|前言|导论|目录|第[零一二三四五六七八九十百千0-9]+[篇章讲]).*"
+        r"^(#{1,3})\s+(?:Chapter|Part|Lecture|Preface|Intro|Appendix|Prologue|Epilogue|Conclusion|Book|Acknowledgements|Contents|Abstract|序|前言|导论|目录|第[零一二三四五六七八九十百千0-9]+[篇章讲]).*"
     )
-    any_header_pattern = re.compile(r"^(#{1,2})\s+(.+)$")
-
-    if confirmed_headings is not None:
-        confirmed_titles = {h["title"] for h in confirmed_headings}
-    else:
-        confirmed_titles = None
+    any_header_pattern = re.compile(r"^(#{1,3})\s+(.+)$")
 
     for line in md_lines:
         match = any_header_pattern.match(line)
         is_split_point = False
+        clean_matched_title = None
+
         if match:
             heading_text = match.group(2).strip()
             heading_text = re.sub(
                 r"\$\s*\\underline\{(.+?)\}\s*\$", "", heading_text
             ).strip()
             heading_text = re.sub(r"^\d+\s+", "", heading_text).strip()
-            if confirmed_titles is not None:
-                is_split_point = heading_text in confirmed_titles
+
+            if confirmed_headings is not None:
+                matched_h = find_matching_heading(heading_text, confirmed_headings)
+                if matched_h:
+                    clean_matched_title = matched_h["title"]
+                    if clean_matched_title != current_chapter_title:
+                        is_split_point = True
             else:
                 is_split_point = bool(major_header_pattern.match(line))
+                if is_split_point:
+                    clean_matched_title = heading_text
 
         # Clean up LaTeX artifacts
         line = re.sub(r"\$\s*\^\{(.+?)\}\s*\$", r"", line)
         line = re.sub(r"\$\s*\\underline\{(.+?)\}\s*\$", "", line)
 
-        if match:
-            if is_split_point:
-                if current_chapter_content:
-                    safe_title = "".join(
-                        [
-                            c
-                            for c in current_chapter_title
-                            if c.isalnum() or c in (" ", "_", "-")
-                        ]
-                    ).strip()
-                    if not safe_title:
-                        safe_title = f"chap_{chapter_count}"
+        if match and is_split_point:
+            # Check if previous chapter has meaningful content before saving
+            content_text = "".join(current_chapter_content).strip()
+            if current_chapter_content and len(content_text) > 30:
+                safe_title = "".join(
+                    [
+                        c
+                        for c in current_chapter_title
+                        if c.isalnum() or c in (" ", "_", "-")
+                    ]
+                ).strip()
+                if not safe_title:
+                    safe_title = f"chap_{chapter_count}"
 
-                    c = epub.EpubHtml(
-                        title=current_chapter_title,
-                        file_name=f"{safe_title}_{chapter_count}.xhtml",
-                        lang="en",
+                c = epub.EpubHtml(
+                    title=current_chapter_title,
+                    file_name=f"{safe_title}_{chapter_count}.xhtml",
+                    lang="en",
+                )
+
+                try:
+                    import markdown
+
+                    html_content = markdown.markdown(
+                        "\n".join(current_chapter_content)
+                    )
+                except ImportError:
+                    html_content = (
+                        "<p>"
+                        + "</p><p>".join(current_chapter_content)
+                        + "</p>"
                     )
 
-                    try:
-                        import markdown
+                c.content = f"<html><head><link rel='stylesheet' href='style/nav.css'/></head><body>{html_content}</body></html>"
+                c.add_item(nav_css)
+                book.add_item(c)
+                chapters.append(c)
+                chapter_count += 1
 
-                        html_content = markdown.markdown(
-                            "\n".join(current_chapter_content)
-                        )
-                    except ImportError:
-                        html_content = (
-                            "<p>"
-                            + "</p><p>".join(current_chapter_content)
-                            + "</p>"
-                        )
-
-                    c.content = f"<html><head><link rel='stylesheet' href='style/nav.css'/></head><body>{html_content}</body></html>"
-                    c.add_item(nav_css)
-                    book.add_item(c)
-                    chapters.append(c)
-                    chapter_count += 1
-
-                current_chapter_title = match.group(2)
-                current_chapter_content = [line]
-            else:
-                current_chapter_content.append(line)
+            current_chapter_title = clean_matched_title or match.group(2)
+            current_chapter_content = [line]
         else:
             current_chapter_content.append(line)
 
@@ -891,21 +1108,19 @@ def main():
         else:
             metadata = extract_metadata_interactive(results, default_title)
 
-        # Step 2.75: TOC Review
+        # Step 2.75: TOC Detection & Review
         if args.no_toc:
             confirmed_headings = []
         elif args.auto_toc:
-            confirmed_headings = None
+            major_h, all_h, _ = detect_chapter_headings(results, metadata.get("title"))
+            confirmed_headings = major_h
         else:
-            print("[-] Detecting chapter headings...")
-            candidates = extract_candidate_headings(results)
-            filtered = filter_heading_candidates(candidates)
-            if len(candidates) > len(filtered):
-                print(
-                    f"  ({len(filtered)} chapter headings found, {len(candidates) - len(filtered)} sub-headings hidden)"
-                )
+            print("[-] Step 2.75: Detecting chapter headings...")
+            major_h, all_h, src = detect_chapter_headings(
+                results, metadata.get("title")
+            )
             confirmed_headings = review_toc_interactive(
-                filtered, all_candidates=candidates
+                major_h, all_h, source=src
             )
 
         # Step 2.9: Verify all images downloaded
