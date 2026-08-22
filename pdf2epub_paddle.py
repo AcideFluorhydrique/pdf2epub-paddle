@@ -278,6 +278,8 @@ def normalize_title(s: str) -> str:
 def is_major_chapter_title(title: str) -> bool:
     """Checks if a title represents a top-level major chapter."""
     clean = title.strip()
+    clean = re.sub(r"^#+\s*", "", clean)
+    clean = re.sub(r"^\|?\d+\|?\s*", "", clean)
     return bool(
         re.match(
             r"^(?:[IVXLCDM]+(?:\.|\b)|\b(?:Chapter|Part|Book|Section|Lecture|Preface|Introduction|Epilogue|Conclusion|Appendix|Index|Prologue|Foreword|Afterword)\b|第[零一二三四五六七八九十百千0-9]+[篇章节讲]|序|前言|导论|后记|附录|索引)",
@@ -285,6 +287,23 @@ def is_major_chapter_title(title: str) -> bool:
             re.I,
         )
     )
+
+
+def is_toc_page_num_line(line: str) -> bool:
+    """Checks if a line ends with a realistic TOC page number (excluding copyright years)."""
+    m = re.search(r"\s+(\d{1,4})$", line.strip())
+    if not m:
+        return False
+    num = int(m.group(1))
+    if 1800 <= num <= 2099:
+        return False
+    if re.search(
+        r"(?:Copyright|Published|Reprinted|Printed|ISBN|All rights reserved|Press|Ltd|Inc)\b",
+        line,
+        re.I,
+    ):
+        return False
+    return True
 
 
 def extract_printed_toc(results: List[Dict]) -> Optional[List[Dict]]:
@@ -295,7 +314,7 @@ def extract_printed_toc(results: List[Dict]) -> Optional[List[Dict]]:
     toc_entries = []
     contents_pages = set()
 
-    # 1. Search first 25 pages for printed Contents / Table of Contents / 目录
+    # 1. Search first 25 pages for printed Contents / Table of Contents / 目录 or dense page-number listings
     for p_idx, r in enumerate(results[:25]):
         for res in r.get("result", {}).get("layoutParsingResults", []):
             md = res["markdown"]["text"]
@@ -308,7 +327,14 @@ def extract_printed_toc(results: List[Dict]) -> Optional[List[Dict]]:
                 )
                 for l in lines
             )
-            if has_contents_header:
+            toc_like_lines = [
+                l
+                for l in lines
+                if is_toc_page_num_line(l)
+                and (is_major_chapter_title(l) or len(l.split()) >= 2)
+            ]
+
+            if has_contents_header or len(toc_like_lines) >= 3:
                 contents_pages.add(p_idx)
                 for line in lines:
                     if re.match(
@@ -318,26 +344,41 @@ def extract_printed_toc(results: List[Dict]) -> Optional[List[Dict]]:
                     ):
                         continue
 
+                    # Check if line is a lowercase dangling continuation fragment
+                    if (
+                        toc_entries
+                        and not is_major_chapter_title(line)
+                        and re.match(r"^(?:and|or|of|in|to|with|for)\b", line)
+                        and is_toc_page_num_line(line)
+                    ):
+                        clean_line = re.sub(r"\s+\d+$", "", line).strip()
+                        toc_entries[-1]["title"] += " " + clean_line
+                        continue
+
                     # TOC entries typically end with a page number or start with a major chapter identifier
-                    has_page_num = bool(re.search(r"\s+\d+$", line))
+                    has_page_num = is_toc_page_num_line(line)
                     is_major = is_major_chapter_title(line)
 
                     if not (has_page_num or is_major):
                         continue  # Skip epigraphs, poems, notes on TOC page
 
                     clean = re.sub(r"\s+\d+$", "", line).strip()
+                    clean = re.sub(r"^#+\s*", "", clean)
                     clean = re.sub(r"\$\s*\\underline\{(.+?)\}\s*\$", r"\1", clean).strip()
+                    clean = re.sub(r"^\|?\d+\|?\s*", "", clean).strip()
+                    clean = re.sub(r"\s+[ivxldcm\d]+$", "", clean, flags=re.I).strip()
                     clean = (
                         re.sub(r"^[-*•\d\.\s]+\s+", "", clean).strip()
                         if clean.startswith(("-", "*", "•"))
                         else clean
                     )
                     if len(clean) >= 3 and not clean.isdigit():
+                        is_major_clean = is_major_chapter_title(clean)
                         toc_entries.append(
                             {
                                 "title": clean,
-                                "is_major": is_major,
-                                "level": 1 if is_major else 2,
+                                "is_major": is_major_clean,
+                                "level": 1 if is_major_clean else 2,
                             }
                         )
 
@@ -363,23 +404,32 @@ def extract_printed_toc(results: List[Dict]) -> Optional[List[Dict]]:
                 page_md = res["markdown"]["text"]
                 for line in page_md.split("\n"):
                     line_clean = line.strip()
-                    if not line_clean:
+                    # Protect against matching within long paragraphs
+                    if not line_clean or (
+                        len(line_clean) > 80 and not line_clean.startswith("#")
+                    ):
                         continue
                     line_norm = normalize_title(line_clean)
                     if not line_norm:
                         continue
 
                     ratio = SequenceMatcher(None, target, line_norm).ratio()
-                    if target in line_norm or ratio > 0.8:
-                        score = ratio + (0.3 if line_clean.startswith("#") else 0)
+                    if ratio > 0.8 or (
+                        len(target) >= 6
+                        and (
+                            line_norm.startswith(target)
+                            or target.startswith(line_norm)
+                        )
+                    ):
+                        score = ratio + (0.4 if line_clean.startswith("#") else 0)
                         if score > best_score:
                             best_score = score
                             best_match_text = line_clean
                             best_page = p_idx + 1
                             if best_score >= 1.2:
                                 break
-            if best_score >= 1.2:
-                break
+                if best_score >= 1.2:
+                    break
 
         if best_page > 0 and best_score >= 0.8:
             last_page = max(last_page, best_page)
@@ -628,7 +678,16 @@ def review_toc_interactive(
 def find_matching_heading(
     line_text: str, confirmed_headings: List[Dict]
 ) -> Optional[Dict]:
-    """Finds if a line matches any of the confirmed headings via normalized fuzzy comparison."""
+    """Finds if a line matches any of the confirmed headings via fuzzy comparison."""
+    # 1. First try exact match on full string (including Roman numerals / chapter numbers)
+    raw_line = re.sub(r"[^a-zA-Z0-9\u4e00-\u9fa5]", "", line_text).lower()
+    if raw_line:
+        for h in confirmed_headings:
+            raw_h = re.sub(r"[^a-zA-Z0-9\u4e00-\u9fa5]", "", h["title"]).lower()
+            if raw_line == raw_h:
+                return h
+
+    # 2. Fallback to normalized title matching (ignoring Roman numerals/formatting)
     norm_line = normalize_title(line_text)
     if not norm_line:
         return None
