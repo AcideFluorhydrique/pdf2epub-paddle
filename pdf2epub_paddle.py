@@ -5,24 +5,27 @@ import base64
 import json
 import re
 import tempfile
-
+import time
+from typing import List, Dict, Any, Optional
 
 import requests
 import fitz  # PyMuPDF
 from ebooklib import epub
-from typing import List, Dict, Any
 from dotenv import load_dotenv
 
 # Load .env file if present (does not override existing env vars)
 load_dotenv()
 
 # --- Configuration ---
-API_URL = "https://s9a8lfu1jd2efbl7.aistudio-app.com/layout-parsing"
-# Environment variable for API token
-API_TOKEN = os.getenv("PADDLE_API_TOKEN", "")
+DEFAULT_JOB_URL = "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs"
+DEFAULT_MODEL = "PaddleOCR-VL-1.6"
 
-CHUNK_SIZE = 5  # Reduced to 5 for maximum reliability
+JOB_URL = os.getenv("PADDLE_API_URL", DEFAULT_JOB_URL)
+API_TOKEN = os.getenv("PADDLE_API_TOKEN", "")
+MODEL = os.getenv("PADDLE_MODEL", DEFAULT_MODEL)
+
 MAX_DAILY_PAGES = 3000
+POLL_INTERVAL_SECONDS = 5
 
 
 def check_dependencies():
@@ -44,112 +47,171 @@ def check_dependencies():
     return True
 
 
-def split_pdf(file_path: str, chunk_size: int = CHUNK_SIZE) -> List[str]:
+def submit_ocr_job(
+    file_path: str,
+    token: str,
+    job_url: str = JOB_URL,
+    model: str = MODEL,
+    optional_payload: Optional[Dict] = None,
+) -> Optional[str]:
     """
-    Splits a PDF into chunks of `chunk_size` pages.
-    Returns a list of paths to the temporary chunk files.
+    Submits a PDF or document file to the PaddleOCR-VL 1.6 Jobs API.
+    Returns the jobId if successful, or None on failure.
     """
-    doc = fitz.open(file_path)
-    total_pages = len(doc)
-    print(f"[*] Total pages: {total_pages}")
+    if not os.path.exists(file_path):
+        print(f"[!] Error: File not found at {file_path}")
+        return None
 
-    if total_pages > MAX_DAILY_PAGES:
-        print(
-            f"[!] WARNING: This document ({total_pages} pages) exceeds the daily API limit of {MAX_DAILY_PAGES} pages."
-        )
-        print("    Processing may fail or get blocked if you exceed your quota.")
+    if optional_payload is None:
+        optional_payload = {
+            "useDocOrientationClassify": False,
+            "useDocUnwarping": False,
+            "useChartRecognition": False,
+        }
 
-    chunk_paths = []
-    temp_dir = tempfile.mkdtemp(prefix="pdf_chunks_")
-
-    for start_page in range(0, total_pages, chunk_size):
-        end_page = min(start_page + chunk_size, total_pages)
-        # Create a new PDF for this chunk
-        chunk_doc = fitz.open()
-        chunk_doc.insert_pdf(doc, from_page=start_page, to_page=end_page - 1)
-
-        chunk_filename = os.path.join(temp_dir, f"chunk_{start_page}_{end_page}.pdf")
-        chunk_doc.save(chunk_filename)
-        chunk_doc.close()
-        chunk_paths.append(chunk_filename)
-
-    doc.close()
-    return chunk_paths
-
-
-def parse_pdf_chunk(chunk_path: str, token: str) -> Dict[str, Any]:
-    """
-    Sends a PDF chunk to the PaddleOCR API and returns the parsed result.
-    """
-    print(f"[*] uploading chunk: {os.path.basename(chunk_path)}")
-
-    with open(chunk_path, "rb") as file:
-        file_bytes = file.read()
-        file_data = base64.b64encode(file_bytes).decode("ascii")
-
-    headers = {"Authorization": f"token {token}", "Content-Type": "application/json"}
-
-    payload = {
-        "file": file_data,
-        "fileType": 0,  # 0 for PDF
-        "useDocOrientationClassify": False,
-        "useDocUnwarping": False,
-        "useChartRecognition": False,  # Basic extraction
+    headers = {
+        "Authorization": f"bearer {token}",
+    }
+    data = {
+        "model": model,
+        "optionalPayload": json.dumps(optional_payload),
     }
 
-    max_retries = 5
+    max_retries = 3
     for attempt in range(max_retries):
         try:
-            response = requests.post(
-                API_URL, json=payload, headers=headers, timeout=180
-            )
-            response.raise_for_status()
-            result = response.json()
-
-            # Handle API responses safely
-            # The API seems to return 'result' directly in some cases, or an 'error' field
-            if "error" in result:
-                print(
-                    f"[!] API Error for chunk {os.path.basename(chunk_path)}: {result['error']}"
+            print(f"[*] Submitting OCR job ({model}) for '{os.path.basename(file_path)}'...")
+            with open(file_path, "rb") as f:
+                files = {"file": f}
+                resp = requests.post(
+                    job_url, headers=headers, data=data, files=files, timeout=120
                 )
+
+            if resp.status_code != 200:
+                print(
+                    f"[!] Job submission failed (status {resp.status_code}): {resp.text}"
+                )
+                if attempt < max_retries - 1:
+                    time.sleep(3)
+                    continue
                 return None
 
-            # If 'responses' is missing but 'result' is present, adapt the result
-            if "responses" not in result and "result" in result:
-                # Wrap the result to maintain compatibility with the rest of the script
-                # if possible, or just return the result directly if it's already the expected object.
-                pass
-
-            return process_layout_results(result, chunk_path)
-
-        except (requests.exceptions.RequestException, ConnectionError) as e:
-            wait_time = (
-                2**attempt
-            ) * 5  # Exponential backoff: 5, 10, 20, 40, 80 seconds
-            print(f"[!] API Request failed (attempt {attempt + 1}/{max_retries}): {e}")
-            if attempt < max_retries - 1:
-                print(f"    Retrying in {wait_time}s...")
-                import time
-
-                time.sleep(wait_time)
-            else:
-                print(
-                    f"[!] Permanently failed processing chunk: {os.path.basename(chunk_path)}"
-                )
+            res_json = resp.json()
+            if res_json.get("code") != 0 and "data" not in res_json:
+                print(f"[!] Job submission error: {res_json.get('msg', 'Unknown error')}")
                 return None
+
+            job_id = str(res_json.get("data", {}).get("jobId"))
+            print(f"[+] Job submitted successfully! Job ID: {job_id}")
+            return job_id
+
         except Exception as e:
             print(
-                f"[!] Unexpected error processing chunk {os.path.basename(chunk_path)}: {e}"
+                f"[!] Connection error during job submission (attempt {attempt + 1}/{max_retries}): {e}"
             )
-            return None
+            if attempt < max_retries - 1:
+                time.sleep(3)
+
+    return None
 
 
-def process_layout_results(result, chunk_path):
-    """Helper to return the result if the original function is missing."""
-    return result
+def poll_ocr_job(
+    job_id: str,
+    token: str,
+    job_url: str = JOB_URL,
+    poll_interval: int = POLL_INTERVAL_SECONDS,
+) -> Optional[str]:
+    """
+    Polls the PaddleOCR Job API until processing is complete.
+    Returns the jsonUrl string pointing to the JSONL results on success.
+    """
+    headers = {
+        "Authorization": f"bearer {token}",
+    }
+    print(f"[*] Polling OCR job status (Job ID: {job_id})...")
+
+    last_status = None
+    while True:
+        try:
+            resp = requests.get(f"{job_url}/{job_id}", headers=headers, timeout=30)
+            if resp.status_code != 200:
+                print(f"[!] Polling HTTP error {resp.status_code}: {resp.text}")
+                time.sleep(poll_interval)
+                continue
+
+            data = resp.json().get("data", {})
+            state = data.get("state")
+
+            if state == "pending":
+                if last_status != "pending":
+                    print("    Status: Pending in queue...")
+                    last_status = "pending"
+            elif state == "running":
+                progress = data.get("extractProgress", {})
+                total_pages = progress.get("totalPages")
+                extracted_pages = progress.get("extractedPages")
+                if total_pages is not None and extracted_pages is not None:
+                    print(
+                        f"    Status: Processing page {extracted_pages}/{total_pages}..."
+                    )
+                else:
+                    if last_status != "running":
+                        print("    Status: Running...")
+                        last_status = "running"
+            elif state == "done":
+                progress = data.get("extractProgress", {})
+                extracted_pages = progress.get("extractedPages", 0)
+                start_time = progress.get("startTime", "")
+                end_time = progress.get("endTime", "")
+                print(
+                    f"[+] Job completed! Successfully extracted {extracted_pages} pages ({start_time} to {end_time})"
+                )
+                json_url = data.get("resultUrl", {}).get("jsonUrl")
+                return json_url
+            elif state == "failed":
+                error_msg = data.get("errorMsg", "Unknown failure")
+                print(f"[!] OCR Job failed: {error_msg}")
+                return None
+            else:
+                print(f"    Status: {state}...")
+
+            time.sleep(poll_interval)
+
+        except Exception as e:
+            print(
+                f"[!] Network error during polling: {e}. Retrying in {poll_interval}s..."
+            )
+            time.sleep(poll_interval)
 
 
-def extract_cover_image(pdf_path: str, output_path: str) -> str:
+def fetch_job_results(json_url: str) -> List[Dict]:
+    """
+    Downloads the JSONL result file from the BOS storage URL and parses each line.
+    """
+    print("[*] Downloading parsing results from cloud storage...")
+    resp = requests.get(json_url, timeout=60)
+    resp.raise_for_status()
+
+    results = []
+    lines = resp.text.strip().split("\n")
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            parsed = json.loads(line)
+            if "result" in parsed:
+                results.append(parsed)
+            else:
+                results.append({"result": parsed})
+        except Exception as e:
+            print(f"[!] Warning: Failed to parse JSONL line: {e}")
+
+    print(f"[+] Successfully loaded {len(results)} page result block(s).")
+    return results
+
+
+def extract_cover_image(pdf_path: str, output_path: str) -> Optional[str]:
     """Renders the first page of a PDF as a PNG image for use as an EPUB cover."""
     doc = fitz.open(pdf_path)
     try:
@@ -169,11 +231,15 @@ def extract_cover_image(pdf_path: str, output_path: str) -> str:
         doc.close()
 
 
-def extract_metadata_interactive(results: List[Dict], default_title: str) -> Dict[str, str]:
+def extract_metadata_interactive(
+    results: List[Dict], default_title: str
+) -> Dict[str, Optional[str]]:
     """Shows the first page OCR text and prompts the user for title and author."""
     first_page_text = ""
     try:
-        first_page_text = results[0]["result"]["layoutParsingResults"][0]["markdown"]["text"]
+        first_page_text = results[0]["result"]["layoutParsingResults"][0]["markdown"][
+            "text"
+        ]
     except (IndexError, KeyError, TypeError):
         pass
 
@@ -184,7 +250,9 @@ def extract_metadata_interactive(results: List[Dict], default_title: str) -> Dic
     else:
         print("\n[!] Could not extract text from the first page.\n")
 
-    title = input(f"Enter book title (or press Enter to use '{default_title}'): ").strip()
+    title = input(
+        f"Enter book title (or press Enter to use '{default_title}'): "
+    ).strip()
     if not title:
         title = default_title
 
@@ -216,12 +284,14 @@ def extract_candidate_headings(results: List[Dict]) -> List[Dict]:
                     title = latex_pattern.sub("", title).strip()
                     # Strip leading bare numbers left after LaTeX cleanup (e.g. "3 What Is..." -> "What Is...")
                     title = re.sub(r"^\d+\s+", "", title).strip()
-                    candidates.append({
-                        "title": title,
-                        "page": global_page,
-                        "level": len(match.group(1)),
-                        "md_line": line,
-                    })
+                    candidates.append(
+                        {
+                            "title": title,
+                            "page": global_page,
+                            "level": len(match.group(1)),
+                            "md_line": line,
+                        }
+                    )
     return candidates
 
 
@@ -248,7 +318,9 @@ def filter_heading_candidates(candidates: List[Dict]) -> List[Dict]:
     return candidates
 
 
-def review_toc_interactive(candidates: List[Dict], all_candidates: List[Dict] = None) -> List[Dict]:
+def review_toc_interactive(
+    candidates: List[Dict], all_candidates: Optional[List[Dict]] = None
+) -> List[Dict]:
     """Interactive prompt for reviewing and editing the auto-detected TOC."""
     if not candidates:
         print("\n[!] No chapter headings detected. The book will be a single chapter.")
@@ -268,7 +340,9 @@ def review_toc_interactive(candidates: List[Dict], all_candidates: List[Dict] = 
         print("  1,3,5      Remove headings by number (comma-separated)")
         print("  +1,3,5     Keep ONLY these headings (comma-separated)")
         if all_candidates and len(all_candidates) > len(candidates):
-            print(f"  all        Show all {len(all_candidates)} headings (including sub-sections)")
+            print(
+                f"  all        Show all {len(all_candidates)} headings (including sub-sections)"
+            )
         print("  none       No chapters (entire book as single chapter)")
         print()
 
@@ -283,7 +357,11 @@ def review_toc_interactive(candidates: List[Dict], all_candidates: List[Dict] = 
             return list(candidates)
         elif choice.lower() == "none":
             return []
-        elif choice.lower() == "all" and all_candidates and len(all_candidates) > len(candidates):
+        elif (
+            choice.lower() == "all"
+            and all_candidates
+            and len(all_candidates) > len(candidates)
+        ):
             candidates = all_candidates
             all_candidates = None
             print(f"\n--- All Headings ({len(candidates)}) ---")
@@ -305,7 +383,9 @@ def review_toc_interactive(candidates: List[Dict], all_candidates: List[Dict] = 
                     if 1 <= num <= len(candidates):
                         nums.add(num)
                     else:
-                        print(f"  [!] Invalid number: {num} (must be 1-{len(candidates)})")
+                        print(
+                            f"  [!] Invalid number: {num} (must be 1-{len(candidates)})"
+                        )
                         valid = False
                         break
 
@@ -313,15 +393,21 @@ def review_toc_interactive(candidates: List[Dict], all_candidates: List[Dict] = 
                     continue
 
                 if keep_mode:
-                    confirmed = [h for i, h in enumerate(candidates) if (i + 1) in nums]
+                    confirmed = [
+                        h for i, h in enumerate(candidates) if (i + 1) in nums
+                    ]
                 else:
-                    confirmed = [h for i, h in enumerate(candidates) if (i + 1) not in nums]
+                    confirmed = [
+                        h for i, h in enumerate(candidates) if (i + 1) not in nums
+                    ]
 
                 if confirmed:
                     print(f"\nUpdated TOC ({len(confirmed)} chapters):")
                     _print_heading_list(confirmed)
                 else:
-                    print("\n  All headings removed. Book will be a single chapter.")
+                    print(
+                        "\n  All headings removed. Book will be a single chapter."
+                    )
 
                 confirm = input("\nConfirm? [Y/n]: ").strip().lower()
                 if confirm in ("", "y", "yes"):
@@ -333,13 +419,14 @@ def review_toc_interactive(candidates: List[Dict], all_candidates: List[Dict] = 
                     continue
 
             except ValueError:
-                print("  [!] Invalid input. Use numbers like '1,3,5' or '+1,3,5' for keep mode.")
+                print(
+                    "  [!] Invalid input. Use numbers like '1,3,5' or '+1,3,5' for keep mode."
+                )
                 continue
 
 
-def download_image(url: str, save_path: str, max_retries: int = 3):
+def download_image(url: str, save_path: str, max_retries: int = 3) -> bool:
     """Downloads an image from a URL to a local path with retry logic."""
-    import time as _time
     for attempt in range(max_retries):
         try:
             response = requests.get(url, timeout=30)
@@ -349,13 +436,17 @@ def download_image(url: str, save_path: str, max_retries: int = 3):
                     f.write(response.content)
                 return True
             else:
-                print(f"[!] Image download HTTP {response.status_code} (attempt {attempt + 1}/{max_retries}): {os.path.basename(save_path)}")
+                print(
+                    f"[!] Image download HTTP {response.status_code} (attempt {attempt + 1}/{max_retries}): {os.path.basename(save_path)}"
+                )
         except Exception as e:
-            print(f"[!] Image download failed (attempt {attempt + 1}/{max_retries}): {os.path.basename(save_path)} - {e}")
+            print(
+                f"[!] Image download failed (attempt {attempt + 1}/{max_retries}): {os.path.basename(save_path)} - {e}"
+            )
         if attempt < max_retries - 1:
-            wait = 2 ** attempt * 2  # 2s, 4s, 8s
+            wait = 2**attempt * 2  # 2s, 4s, 8s
             print(f"    Retrying in {wait}s...")
-            _time.sleep(wait)
+            time.sleep(wait)
     print(f"[!] PERMANENT FAILURE downloading: {os.path.basename(save_path)}")
     return False
 
@@ -380,16 +471,22 @@ def verify_all_images_downloaded(results: List[Dict], image_dir: str) -> tuple:
     return total, missing
 
 
-def create_epub(title: str, results: List[Dict], output_file: str, image_dir: str,
-                cover_image_path: str = None, author: str = None,
-                confirmed_headings: List[Dict] = None):
+def create_epub(
+    title: str,
+    results: List[Dict],
+    output_file: str,
+    image_dir: str,
+    cover_image_path: Optional[str] = None,
+    author: Optional[str] = None,
+    confirmed_headings: Optional[List[Dict]] = None,
+):
     """
     Creates an EPUB file from the aggregated API results.
     """
     book = epub.EpubBook()
     book.set_identifier(f"id_{title}")
     book.set_title(title)
-    book.set_language("en")  # Or auto-detect?
+    book.set_language("en")
 
     if author:
         book.add_author(author)
@@ -417,20 +514,7 @@ def create_epub(title: str, results: List[Dict], output_file: str, image_dir: st
     )
     book.add_item(nav_css)
 
-    # Process each chunk's result
-    # The API returns 'result' -> 'layoutParsingResults' (list)
-    # Each item in layoutParsingResults corresponds to a page (usually)
-
-    # Combine all pages into chapters if they have headings, or just page-by-page?
-    # Better to just append text. If we see a H1/H2, we can make a split potentially,
-    # but for simplicity, let's dump pages into one big flow or chapter-per-chunk?
-    # 50 pages per chapter is too much.
-    # Let's try to detect headers in the markdown to split chapters.
-
     full_markdown = ""
-
-    # Aggregated images to add to the book
-    # Map API image path (e.g. 'images/tmp.jpg') to internal EPUB path
 
     for chunk_idx, result in enumerate(results):
         if not result or "result" not in result:
@@ -439,184 +523,131 @@ def create_epub(title: str, results: List[Dict], output_file: str, image_dir: st
         layout_results = result["result"].get("layoutParsingResults", [])
 
         for i, page_res in enumerate(layout_results):
-            # 1. Get Markdown Text
             page_md = page_res["markdown"]["text"]
-
-            # 2. Handle Images
-            # page_res["markdown"]["images"] is { relative_path: url }
-            # The markdown text uses relative_path: ![](images/xxx.jpg)
             images_map = page_res["markdown"].get("images", {})
 
             for rel_path, img_url in images_map.items():
-                # Define local path where we downloaded the image
                 local_img_path = os.path.join(image_dir, rel_path)
-
-                # Check if we successfully downloaded it
                 if os.path.exists(local_img_path):
-                    # Add to EPUB
-                    # Read image data
                     with open(local_img_path, "rb") as img_f:
                         img_data = img_f.read()
 
-                    # Create EPUB Image Item
-                    # Use the same relative path as filename to match markdown links
-                    # (assuming markdown is ![](images/xxx))
                     epub_img = epub.EpubImage()
                     epub_img.file_name = rel_path
-                    epub_img.media_type = (
-                        "image/jpeg"  # Assuming JPG, might need detection
-                    )
+                    epub_img.media_type = "image/jpeg"
                     epub_img.content = img_data
 
                     if rel_path not in [item.file_name for item in book.get_items()]:
                         book.add_item(epub_img)
 
-            # 3. Concatenate Text with paragraph reflow
-            # Reflow lines into continuous paragraphs to fix sentence splitting issues
-            # Pages often break sentences mid-flow, and OCR can split paragraphs
-            # into separate lines that should be joined.
-            
+            # Paragraph reflowing
             lines = page_md.split("\n")
             cleaned_lines = []
             for line in lines:
-                # Basic Page Number Removal (digit only)
                 if line.strip().isdigit():
                     continue
                 cleaned_lines.append(line)
-            
-            # Reflow: join lines that appear to be part of the same paragraph
+
             reflowed_paragraphs = []
             current_para = ""
-            
-            # Terminal punctuation that indicates end of sentence/paragraph
-            terminal_chars = ('.', '!', '?', '"', "'", ')', ']', '}', ':', ';')
-            # Patterns that indicate a line is a header or special block
-            header_pattern = re.compile(r'^(#{1,6}\s|>|\s*[-*]\s|\d+\.)')
-            # Characters that indicate a line should not be joined with next
-            non_join_endings = (':', ';', ',', '-')
-            
-            for i, line in enumerate(cleaned_lines):
+
+            terminal_chars = (".", "!", "?", '"', "'", ")", "]", "}", ":", ";")
+            header_pattern = re.compile(r"^(#{1,6}\s|>|\s*[-*]\s|\d+\.)")
+            non_join_endings = (":", ";", ",", "-")
+
+            for line in cleaned_lines:
                 stripped = line.rstrip()
                 if not stripped:
-                    # Empty line indicates paragraph break
                     if current_para:
                         reflowed_paragraphs.append(current_para)
                         current_para = ""
                     continue
-                
-                # Check if this line is a header/list/blockquote
+
                 is_special = header_pattern.match(stripped)
-                
+
                 if is_special:
-                    # Flush current paragraph before special line
                     if current_para:
                         reflowed_paragraphs.append(current_para)
                         current_para = ""
                     reflowed_paragraphs.append(stripped)
                 elif not current_para:
-                    # Start of new paragraph
                     current_para = stripped
                 else:
-                    # Check if current_para ends with terminal punctuation
-                    # or if it ends with colon/comma/semicolon (likely list/address item)
                     current_ends = current_para.rstrip()
-                    
                     if current_ends.endswith(terminal_chars):
-                        # Previous paragraph ends with terminal punctuation
-                        # This line starts a new paragraph
                         reflowed_paragraphs.append(current_para)
                         current_para = stripped
                     elif current_ends and current_ends[-1] in non_join_endings:
-                        # Previous line ends with :, ;, , or - - likely list item or address
-                        # Don't join, start new paragraph
                         reflowed_paragraphs.append(current_para)
                         current_para = stripped
                     elif len(stripped) < 20 and not stripped.endswith(terminal_chars):
-                        # Short line that doesn't end with punctuation - might be 
-                        # a title, caption, or deliberate short line (poetry, etc.)
                         reflowed_paragraphs.append(current_para)
                         current_para = stripped
                     else:
-                        # Likely continuation of same paragraph
                         current_para = current_ends + " " + stripped
-            
-            # Don't forget the last paragraph
+
             if current_para:
                 reflowed_paragraphs.append(current_para)
-            
-            # Join paragraphs and append to full_markdown
-            # But first, check if we need to merge with the previous page's content
-            # (sentences can be split across page boundaries)
+
             page_markdown = "\n\n".join(reflowed_paragraphs)
-            
+
             if full_markdown and page_markdown:
-                # Check if full_markdown ends mid-sentence (no terminal punctuation)
-                # and page_markdown starts with a continuation (not a header)
                 full_stripped = full_markdown.rstrip()
-                page_lines = page_markdown.split('\n')
+                page_lines = page_markdown.split("\n")
                 first_page_line = page_lines[0].strip() if page_lines else ""
-                
-                # Check if we should merge (previous doesn't end with terminal, next isn't a header)
-                ends_mid_sentence = full_stripped and not full_stripped.endswith(terminal_chars)
-                next_is_header = header_pattern.match(first_page_line) if first_page_line else False
-                
+
+                ends_mid_sentence = full_stripped and not full_stripped.endswith(
+                    terminal_chars
+                )
+                next_is_header = (
+                    header_pattern.match(first_page_line) if first_page_line else False
+                )
+
                 if ends_mid_sentence and not next_is_header:
-                    # Merge: remove the trailing newlines and join with space
-                    full_markdown = full_markdown.rstrip() + " " + page_markdown + "\n\n"
+                    full_markdown = (
+                        full_markdown.rstrip() + " " + page_markdown + "\n\n"
+                    )
                 else:
                     full_markdown += page_markdown + "\n\n"
             else:
                 full_markdown += page_markdown + "\n\n"
-
-    # Split markdown into chapters based on headers (# Header)
-    # If no headers found, put everything in one chapter.
-
-    # Split by H1 or H2, BUT only if it looks like a real Chapter/Part title
-    # Regex for headers: ^#+ \s* (Title)
 
     md_lines = full_markdown.split("\n")
     current_chapter_title = "Start"
     current_chapter_content = []
     chapter_count = 0
 
-    # Regex to identify "Major" headers (Chapters/Parts) to split on (legacy fallback)
     major_header_pattern = re.compile(
         r"^(#{1,2})\s+(?:Chapter|Part|Lecture|Preface|Intro|Appendix|Prologue|Epilogue|Conclusion|Book|Acknowledgements|Contents|Abstract|序|前言|导论|目录|第[零一二三四五六七八九十百千0-9]+[篇章讲]).*"
     )
-
-    # Regex for ANY header to format as H1/H2 in HTML but not necessarily split
     any_header_pattern = re.compile(r"^(#{1,2})\s+(.+)$")
 
-    # Build set of confirmed heading titles for O(1) lookup
     if confirmed_headings is not None:
         confirmed_titles = {h["title"] for h in confirmed_headings}
     else:
-        confirmed_titles = None  # use legacy regex fallback
+        confirmed_titles = None
 
     for line in md_lines:
-        # Check if line is a header (before LaTeX cleanup, to match extracted candidates)
         match = any_header_pattern.match(line)
         is_split_point = False
         if match:
             heading_text = match.group(2).strip()
-            # Clean LaTeX artifacts for matching
-            heading_text = re.sub(r"\$\s*\\underline\{(.+?)\}\s*\$", "", heading_text).strip()
+            heading_text = re.sub(
+                r"\$\s*\\underline\{(.+?)\}\s*\$", "", heading_text
+            ).strip()
             heading_text = re.sub(r"^\d+\s+", "", heading_text).strip()
-            # Determine if this heading is a chapter split point
             if confirmed_titles is not None:
                 is_split_point = heading_text in confirmed_titles
             else:
                 is_split_point = bool(major_header_pattern.match(line))
 
         # Clean up LaTeX artifacts
-        line = re.sub(r"\$\s*\^\{(.+?)\}\s*\$", r"", line)  # superscripts
-        line = re.sub(r"\$\s*\\underline\{(.+?)\}\s*\$", "", line)  # underlines
+        line = re.sub(r"\$\s*\^\{(.+?)\}\s*\$", r"", line)
+        line = re.sub(r"\$\s*\\underline\{(.+?)\}\s*\$", "", line)
 
         if match:
             if is_split_point:
-                # If we have content for the previous chapter, save it
                 if current_chapter_content:
-                    # Determine filename
                     safe_title = "".join(
                         [
                             c
@@ -641,7 +672,9 @@ def create_epub(title: str, results: List[Dict], output_file: str, image_dir: st
                         )
                     except ImportError:
                         html_content = (
-                            "<p>" + "</p><p>".join(current_chapter_content) + "</p>"
+                            "<p>"
+                            + "</p><p>".join(current_chapter_content)
+                            + "</p>"
                         )
 
                     c.content = f"<html><head><link rel='stylesheet' href='style/nav.css'/></head><body>{html_content}</body></html>"
@@ -653,14 +686,12 @@ def create_epub(title: str, results: List[Dict], output_file: str, image_dir: st
                 current_chapter_title = match.group(2)
                 current_chapter_content = [line]
             else:
-                # It's a minor header (e.g. Section), just keep it in flow
                 current_chapter_content.append(line)
         else:
             current_chapter_content.append(line)
 
     # Add last chapter
     if current_chapter_content:
-        # Determine filename
         safe_title = "".join(
             [c for c in current_chapter_title if c.isalnum() or c in (" ", "_", "-")]
         ).strip()
@@ -684,7 +715,6 @@ def create_epub(title: str, results: List[Dict], output_file: str, image_dir: st
         book.add_item(c)
         chapters.append(c)
 
-    # If no chapters were created (no headers found), create one big chapter
     if not chapters and full_markdown:
         c = epub.EpubHtml(title="Content", file_name="content.xhtml", lang="en")
         try:
@@ -710,17 +740,35 @@ def main():
     if not check_dependencies():
         return
 
-    parser = argparse.ArgumentParser(description="Scanned PDF to Epub Converter")
+    parser = argparse.ArgumentParser(
+        description="Scanned PDF to EPUB Converter (Powered by PaddleOCR-VL 1.6)"
+    )
     parser.add_argument("input_pdf", help="Path to input PDF file")
     parser.add_argument(
         "--output", "-o", help="Path to output EPUB file (default: input_name.epub)"
     )
     parser.add_argument("--title", help="Book title (skips interactive prompt)")
     parser.add_argument("--author", help="Author name (skips interactive prompt)")
-    parser.add_argument("--auto-toc", action="store_true",
-                        help="Skip interactive TOC review; use auto-detected headings")
-    parser.add_argument("--no-toc", action="store_true",
-                        help="Skip heading detection; produce single-chapter EPUB")
+    parser.add_argument(
+        "--auto-toc",
+        action="store_true",
+        help="Skip interactive TOC review; use auto-detected headings",
+    )
+    parser.add_argument(
+        "--no-toc",
+        action="store_true",
+        help="Skip heading detection; produce single-chapter EPUB",
+    )
+    parser.add_argument(
+        "--model",
+        default=MODEL,
+        help=f"PaddleOCR model name (default: {MODEL})",
+    )
+    parser.add_argument(
+        "--url",
+        default=JOB_URL,
+        help=f"PaddleOCR Jobs API URL (default: {JOB_URL})",
+    )
     args = parser.parse_args()
 
     input_path = args.input_pdf
@@ -734,18 +782,30 @@ def main():
 
     if not API_TOKEN:
         print("[!] Error: PADDLE_API_TOKEN environment variable is not set.")
-        print("    Please set it using: export PADDLE_API_TOKEN='your_token_here'")
+        print("    Please set it in .env or via: export PADDLE_API_TOKEN='your_token_here'")
         return
 
     if not args.output:
         args.output = os.path.splitext(input_path)[0] + ".epub"
 
-    # Create a unique work directory based on the input filename hash
+    # Check total pages
+    doc = fitz.open(input_path)
+    total_pages = len(doc)
+    doc.close()
+    print(f"[*] Total pages: {total_pages}")
+
+    if total_pages > MAX_DAILY_PAGES:
+        print(
+            f"[!] WARNING: This document ({total_pages} pages) exceeds the daily API limit of {MAX_DAILY_PAGES} pages."
+        )
+        print("    Processing may fail or get blocked if you exceed your quota.")
+
+    # Unique work directory based on filename and size hash
     import hashlib
 
-    file_hash = hashlib.md5(os.path.basename(input_path).encode("utf-8")).hexdigest()[
-        :8
-    ]
+    file_stat = os.stat(input_path)
+    file_sig = f"{os.path.basename(input_path)}_{file_stat.st_size}"
+    file_hash = hashlib.md5(file_sig.encode("utf-8")).hexdigest()[:8]
     work_dir = f"paddle_epub_work_{file_hash}"
 
     print(f"[*] Work directory: {work_dir}")
@@ -753,66 +813,76 @@ def main():
     image_dir = os.path.join(work_dir, "images")
     os.makedirs(image_dir, exist_ok=True)
 
+    results_file = os.path.join(work_dir, "results.json")
+    job_info_file = os.path.join(work_dir, "job_info.json")
+
     try:
-        # Step 1: Chunking
-        print("[-] Step 1: Splitting PDF...")
-        chunk_paths = split_pdf(input_path)
+        # Step 1: Extract cover image
+        cover_path = extract_cover_image(
+            input_path, os.path.join(work_dir, "cover.png")
+        )
 
-        # Step 1.5: Extract cover image
-        cover_path = extract_cover_image(input_path, os.path.join(work_dir, "cover.png"))
-
-        # Step 2: API Processing
+        # Step 2: OCR Processing via PaddleOCR-VL 1.6 Jobs API
         results = []
-        print(f"[-] Step 2: Processing {len(chunk_paths)} chunks via PaddleOCR API...")
-        for i, chunk in enumerate(chunk_paths):
-            chunk_name = os.path.basename(chunk)
-            json_checkpoint = os.path.join(work_dir, chunk_name + ".json")
+        if os.path.exists(results_file):
+            print(
+                "    [+] Resuming: Found completed OCR results from previous run."
+            )
+            with open(results_file, "r", encoding="utf-8") as f:
+                results = json.load(f)
+        else:
+            job_id = None
+            if os.path.exists(job_info_file):
+                try:
+                    with open(job_info_file, "r", encoding="utf-8") as f:
+                        job_data = json.load(f)
+                        job_id = job_data.get("jobId")
+                        if job_id:
+                            print(
+                                f"    [+] Resuming: Found existing job checkpoint (Job ID: {job_id})"
+                            )
+                except Exception:
+                    job_id = None
 
-            if os.path.exists(json_checkpoint):
-                print(
-                    f"    [+] Resuming: Found checkpoint for chunk {i + 1}/{len(chunk_paths)}"
+            if not job_id:
+                job_id = submit_ocr_job(
+                    input_path, API_TOKEN, job_url=args.url, model=args.model
                 )
-                with open(json_checkpoint, "r") as f:
-                    res = json.load(f)
-            else:
-                # Rate limiting: Sleep before new request
-                if i > 0:
-                    print("    ...waiting 5s to respect API rate limits...")
-                    import time
+                if not job_id:
+                    print("[!] Failed to submit OCR job. Aborting.")
+                    sys.exit(1)
+                with open(job_info_file, "w", encoding="utf-8") as f:
+                    json.dump({"jobId": job_id}, f)
 
-                    time.sleep(5)
-
-                print(f"    Processing chunk {i + 1}/{len(chunk_paths)}...")
-                # Increased timeout to 180s
-                res = parse_pdf_chunk(chunk, API_TOKEN)
-
-                if res:
-                    # Save checkpoint
-                    os.makedirs(os.path.dirname(json_checkpoint), exist_ok=True)
-                    with open(json_checkpoint, "w") as f:
-                        json.dump(res, f)
-
-            if res:
-                results.append(res)
-
-                # Download images immediately to save locally
-                layout_results = res.get("result", {}).get("layoutParsingResults", [])
-                for page_res in layout_results:
-                    images_map = page_res["markdown"].get("images", {})
-                    for rel_path, img_url in images_map.items():
-                        local_path = os.path.join(image_dir, rel_path)
-                        if not os.path.exists(
-                            local_path
-                        ):  # Don't re-download if exists
-                            download_image(img_url, local_path)
-            else:
+            json_url = poll_ocr_job(job_id, API_TOKEN, job_url=args.url)
+            if not json_url:
                 print(
-                    f"[!] CRITICAL: Failed to process chunk {i + 1}. Aborting to prevent incomplete book."
-                )
-                print(
-                    "    Please resolve connectivity issues and re-run the script to resume."
+                    "[!] CRITICAL: OCR job did not return a valid result URL. Aborting."
                 )
                 sys.exit(1)
+
+            results = fetch_job_results(json_url)
+            if not results:
+                print(
+                    "[!] CRITICAL: No results parsed from OCR job output. Aborting."
+                )
+                sys.exit(1)
+
+            with open(results_file, "w", encoding="utf-8") as f:
+                json.dump(results, f, ensure_ascii=False, indent=2)
+
+        # Download images immediately
+        print("[-] Downloading document images...")
+        for res in results:
+            layout_results = res.get("result", {}).get(
+                "layoutParsingResults", []
+            )
+            for page_res in layout_results:
+                images_map = page_res["markdown"].get("images", {})
+                for rel_path, img_url in images_map.items():
+                    local_path = os.path.join(image_dir, rel_path)
+                    if not os.path.exists(local_path):
+                        download_image(img_url, local_path)
 
         # Step 2.5: Metadata extraction
         default_title = os.path.splitext(os.path.basename(input_path))[0]
@@ -827,18 +897,26 @@ def main():
         elif args.auto_toc:
             confirmed_headings = None
         else:
-            print("[-] Step 2.75: Detecting chapter headings...")
+            print("[-] Detecting chapter headings...")
             candidates = extract_candidate_headings(results)
             filtered = filter_heading_candidates(candidates)
             if len(candidates) > len(filtered):
-                print(f"  ({len(filtered)} chapter headings found, {len(candidates) - len(filtered)} sub-headings hidden)")
-            confirmed_headings = review_toc_interactive(filtered, all_candidates=candidates)
+                print(
+                    f"  ({len(filtered)} chapter headings found, {len(candidates) - len(filtered)} sub-headings hidden)"
+                )
+            confirmed_headings = review_toc_interactive(
+                filtered, all_candidates=candidates
+            )
 
         # Step 2.9: Verify all images downloaded
-        print("[-] Step 2.9: Verifying image downloads...")
-        total_imgs, missing_imgs = verify_all_images_downloaded(results, image_dir)
+        print("[-] Verifying image downloads...")
+        total_imgs, missing_imgs = verify_all_images_downloaded(
+            results, image_dir
+        )
         if missing_imgs:
-            print(f"[!] WARNING: {len(missing_imgs)}/{total_imgs} images failed to download.")
+            print(
+                f"[!] WARNING: {len(missing_imgs)}/{total_imgs} images failed to download."
+            )
             print("    Attempting re-download of missing images...")
             still_missing = []
             for rel_path, img_url in missing_imgs:
@@ -849,11 +927,13 @@ def main():
                 print(f"\n[!] FAILED to download {len(still_missing)} image(s):")
                 for p in still_missing:
                     print(f"    - {p}")
-                proceed = input("\nProceed with EPUB generation anyway? [y/N]: ").strip().lower()
+                proceed = (
+                    input("\nProceed with EPUB generation anyway? [y/N]: ")
+                    .strip()
+                    .lower()
+                )
                 if proceed not in ("y", "yes"):
-                    print("[*] Aborted. Re-run the script to retry (cached chunks will be reused).")
-                    print("    NOTE: Image URLs expire. You may need to delete the chunk JSON")
-                    print(f"    files in '{work_dir}' and re-run to get fresh URLs.")
+                    print("[*] Aborted.")
                     sys.exit(1)
             else:
                 print(f"    All {total_imgs} images now verified.")
@@ -861,17 +941,18 @@ def main():
             print(f"    All {total_imgs} images verified.")
 
         # Step 3: Generation
-        print("[-] Step 3: Generating EPUB...")
-        create_epub(metadata["title"], results, args.output, image_dir,
-                    cover_image_path=cover_path, author=metadata["author"],
-                    confirmed_headings=confirmed_headings)
+        print("[-] Generating EPUB...")
+        create_epub(
+            metadata["title"],
+            results,
+            args.output,
+            image_dir,
+            cover_image_path=cover_path,
+            author=metadata["author"],
+            confirmed_headings=confirmed_headings,
+        )
 
     finally:
-        # Cleanup temp chunks
-        # shutil.rmtree(work_dir) # Optional: keep for debugging?
-        # Let's cleanup the split PDFs but maybe keep the images for a bit or just assume user might want them?
-        # For a clean tool, we should clean up.
-        # But for now, let's leave 'paddle_epub_work' so user can inspect if something goes wrong.
         print(
             f"[*] Done. Intermediate files are in '{work_dir}'. You can delete this folder if verified."
         )

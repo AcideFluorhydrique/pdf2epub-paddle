@@ -2,20 +2,18 @@
 
 [English](README.md) | [中文](README_zh.md)
 
-This tool converts scanned PDF books into clean, readable EPUB ebooks using the Baidu PaddleOCR Layout Analysis API.
+This tool converts scanned PDF books into clean, readable EPUB ebooks using the Baidu PaddleOCR-VL 1.6 Layout Analysis Jobs API.
 
 ## Features
 
-- **High-Quality Layout Analysis**: Uses PaddleOCR to intelligently detect paragraphs, headers, images, and tables.
+- **High-Quality Layout Analysis**: Powered by PaddleOCR-VL 1.6 (OmniDocBench 96.3% SOTA, PP-DocLayoutV3) to intelligently detect paragraphs, headers, images, and tables.
+- **Asynchronous Cloud Processing**: Uses the PaddleOCR v2 Jobs API for native multi-page processing with real-time progress updates (`extractedPages / totalPages`).
 - **Smart Chapter Splitting**: Automatically detects chapter headings from OCR output. An interactive TOC review lets you confirm, remove, or adjust detected chapters before generating the EPUB.
 - **Cover Image**: Automatically extracts the first page of the PDF as the EPUB cover.
 - **Metadata Support**: Interactively prompts for book title and author based on OCR'd first-page text, or accepts them via CLI arguments.
-- **Image Embedding**: Preserves images from the original PDF.
-- **Clean Output**: Removes headers, footers, and page numbers for a seamless reading experience.
-- **Robustness**:
-  - **Checkpointing**: Saves progress after every chunk. If interrupted, simply re-run to resume.
-  - **Rate Limiting**: Includes delays to respect API limits.
-  - **Retry Logic**: Automatically retries failed API requests.
+- **Image Embedding**: Preserves and embeds images from the original PDF into the EPUB.
+- **Clean Output**: Removes headers, footers, and page numbers, and reflows split sentences for a seamless reading experience.
+- **Robust Checkpointing**: Saves job ID and result JSON locally. If interrupted, simply re-run to resume immediately.
 
 ## Prerequisites
 
@@ -25,10 +23,8 @@ This tool converts scanned PDF books into clean, readable EPUB ebooks using the 
 ## Getting an API Token
 
 1. Log in to [Baidu AIStudio (飞桨星河社区)](https://aistudio.baidu.com/).
-2. Go to the **"Applications"** or **"Online Models"** section (Layout Parsing).
-3. Find the **"PaddleOCR"** or **"Document Analysis"** API.
-4. Copy your private **API Token** from your user profile or application settings dashboard.
-    *Note: Ensure you have sufficient quota (pages/day) for your usage.*
+2. Go to the **PaddleOCR** / **PaddleOCR-VL-1.6** model or application section.
+3. Copy your private **API Token** from your user profile or API dashboard.
 
 ## Installation & Usage (Recommended: `uv`)
 
@@ -56,41 +52,42 @@ This project uses [uv](https://github.com/astral-sh/uv) for fast, reliable depen
 
     Edit `.env` and add your token:
 
-    ```
+    ```env
     PADDLE_API_TOKEN=your_api_token_here
+    # Optional override:
+    # PADDLE_API_URL=https://paddleocr.aistudio-app.com/api/v2/ocr/jobs
+    # PADDLE_MODEL=PaddleOCR-VL-1.6
     ```
 
-4. **Run directly with `uv`** (handles virtualenv & dependencies automatically):
+4. **Run directly with `uv`**:
 
     ```bash
     uv run pdf2epub_paddle.py /path/to/your/book.pdf
     ```
 
-    The tool will display the OCR'd text from the first page and prompt you to enter the book title and author.
+    The tool will submit the PDF as an OCR job, show real-time progress, display OCR'd text from the first page, prompt for metadata, and review TOC chapters.
 
-    You can also provide metadata directly via CLI arguments:
+### CLI Options
 
-    ```bash
-    uv run pdf2epub_paddle.py --title "Book Title" --author "Author Name" /path/to/your/book.pdf
-    ```
+- **Provide Metadata Directly**:
+  ```bash
+  uv run pdf2epub_paddle.py --title "Book Title" --author "Author Name" /path/to/your/book.pdf
+  ```
 
-    To specify a custom output path:
+- **Custom Output Path**:
+  ```bash
+  uv run pdf2epub_paddle.py --output /path/to/output.epub /path/to/your/book.pdf
+  ```
 
-    ```bash
-    uv run pdf2epub_paddle.py --output /path/to/output.epub /path/to/your/book.pdf
-    ```
+- **Skip Interactive TOC Review (Auto-detect)**:
+  ```bash
+  uv run pdf2epub_paddle.py --auto-toc /path/to/your/book.pdf
+  ```
 
-    To skip the interactive TOC review and use automatic chapter detection:
-
-    ```bash
-    uv run pdf2epub_paddle.py --auto-toc /path/to/your/book.pdf
-    ```
-
-    To produce a single-chapter EPUB with no chapter splitting:
-
-    ```bash
-    uv run pdf2epub_paddle.py --no-toc /path/to/your/book.pdf
-    ```
+- **Single Chapter EPUB (No TOC splitting)**:
+  ```bash
+  uv run pdf2epub_paddle.py --no-toc /path/to/your/book.pdf
+  ```
 
 ### Global Command Support
 
@@ -107,45 +104,6 @@ You can run the tool from anywhere using the `epub` command:
     ```bash
     epub /path/to/your/book.pdf
     ```
-
-    The `epub` script automatically uses `uv run --project` to locate the correct environment regardless of your current directory.
-
-### Alternative: Standard Pip
-
-If you prefer standard pip:
-
-1. Create a virtual environment:
-
-    ```bash
-    python -m venv .venv
-    source .venv/bin/activate
-    ```
-
-2. Install dependencies:
-
-    ```bash
-    pip install .  # Installs from pyproject.toml
-    ```
-
-3. Set up your API token:
-
-    ```bash
-    cp .env.example .env
-    # Edit .env and add your token
-    ```
-
-4. Run:
-
-    ```bash
-    python pdf2epub_paddle.py /path/to/your/book.pdf
-    ```
-
-> **Note**: You can also set the token via environment variable directly: `export PADDLE_API_TOKEN='your_token'`. The `.env` file is loaded automatically but will not override an existing environment variable.
-
-## Configuration
-
-- **Chunk Size**: Default is 5 pages per chunk to ensure stability. You can modify `CHUNK_SIZE` in the script if you have a stable connection and higher limits.
-- **Timeout**: Default timeout is 180s per request.
 
 ## License
 

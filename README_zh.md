@@ -2,31 +2,23 @@
 
 [English](README.md) | [中文](README_zh.md)
 
-本工具利用百度 PaddleOCR 版面分析 API，将扫描版 PDF 书籍转换为清晰、易读的 EPUB 电子书。
+本工具利用百度 PaddleOCR-VL 1.6 版面分析 API，将扫描版 PDF 书籍转换为清晰、易读的 EPUB 电子书。
 
 ## 功能特性
 
-- **高质量版面分析**：使用 PaddleOCR 智能识别段落、标题、图片和表格。
-- **智能章节分割**：根据标题（如“第一章”、“Part I”）自动将书籍分割为不同章节。
-- **保留图片**：完整保留原 PDF 中的图片。
-- **纯净输出**：自动移除页眉、页脚和页码，提供无缝阅读体验。
-- **高鲁棒性**：
-  - **断点续传**：每处理完一个分块自动保存进度。如果中断，重新运行即可从断点处继续。
-  - **速率限制**：内置延时以遵守 API 调用频率限制。
-  - **自动重试**：遇到 API 请求失败时自动重试。
+- **高质量版面分析**：采用 PaddleOCR-VL 1.6（OmniDocBench 96.3% SOTA，PP-DocLayoutV3）智能识别段落、标题、图片、表格及公式。
+- **异步任务处理**：使用 PaddleOCR v2 Jobs 异步任务接口，原生支持多页处理与实时进度显示（`extractedPages / totalPages`）。
+- **智能章节分割**：自动检测各级标题，并提供交互式目录（TOC）确认与调整机制。
+- **自动封面提取**：自动将 PDF 首页渲染提取为 EPUB 封面图片。
+- **元数据支持**：根据第一页 OCR 结果交互式提示输入书名与作者，或通过命令行参数指定。
+- **保留并嵌入图片**：完整保留原文档中的图片并自动嵌入 EPUB。
+- **纯净阅读体验**：自动过滤页眉、页脚与页码，重排跨行截断语句。
+- **断点续传**：自动保存 Job ID 与识别结果。如遇中断，再次运行可直接从检查点继续。
 
 ## 前置要求
 
 - Python 3.8+
 - PaddleOCR API Token（从 [百度飞桨星河社区 (AIStudio)](https://aistudio.baidu.com/) 获取）
-
-## 获取 API Token
-
-1. 登录 [百度飞桨星河社区 (AIStudio)](https://aistudio.baidu.com/)。
-2. 进入 **“应用中心”** 或 **“在线模型”** 版块（寻找版面分析/Layout Parsing 相关服务）。
-3. 找到 **“PaddleOCR”** 或 **“文档分析”** API。
-4. 在个人中心或应用设置中复制你的私有 **API Token**。
-    *注意：请确保你的账户有足够的调用额度（页数/天）。*
 
 ## 安装与使用 (推荐使用 `uv`)
 
@@ -39,66 +31,57 @@
     cd pdf2epub-paddle
     ```
 
-2. **安装 `uv`** (如果你尚未安装)：
+2. **配置 API Token**：
 
     ```bash
-    # macOS/Linux
-    curl -LsSf https://astral.sh/uv/install.sh | sh
+    cp .env.example .env
     ```
 
-3. **使用 `uv` 直接运行** (自动处理虚拟环境和依赖)：
+    编辑 `.env` 文件填入你的 Token：
+
+    ```env
+    PADDLE_API_TOKEN=你的api_token
+    # 可选自定义：
+    # PADDLE_API_URL=https://paddleocr.aistudio-app.com/api/v2/ocr/jobs
+    # PADDLE_MODEL=PaddleOCR-VL-1.6
+    ```
+
+3. **使用 `uv` 运行**：
 
     ```bash
-    export PADDLE_API_TOKEN='你的api_token'
     uv run pdf2epub_paddle.py /path/to/your/book.pdf
     ```
 
+### 命令行参数
+
+- **直接指定元数据**：
+  ```bash
+  uv run pdf2epub_paddle.py --title "书名" --author "作者名" /path/to/your/book.pdf
+  ```
+
+- **指定输出路径**：
+  ```bash
+  uv run pdf2epub_paddle.py --output /path/to/output.epub /path/to/your/book.pdf
+  ```
+
+- **跳过交互式目录确认（全自动目录分割）**：
+  ```bash
+  uv run pdf2epub_paddle.py --auto-toc /path/to/your/book.pdf
+  ```
+
+- **单章节模式（不拆分章节）**：
+  ```bash
+  uv run pdf2epub_paddle.py --no-toc /path/to/your/book.pdf
+  ```
+
 ### 全局命令支持
 
-你可以通过创建符号链接在任何目录下使用 `epub` 命令：
+你可通过创建符号链接在任意目录下直接使用 `epub` 命令：
 
-1. **设置**：
-
-    ```bash
-    sudo ln -s "$(pwd)/epub" /usr/local/bin/epub
-    ```
-
-2. **使用**：
-
-    ```bash
-    epub /path/to/your/book.pdf
-    ```
-
-    `epub` 脚本会自动使用 `uv run --project` 找到正确的运行环境。
-
-### 替代方案：使用标准 Pip
-
-如果你更习惯使用标准 pip：
-
-1. 创建虚拟环境：
-
-    ```bash
-    python -m venv .venv
-    source .venv/bin/activate
-    ```
-
-2. 安装依赖：
-
-    ```bash
-    pip install .  # 根据 pyproject.toml 安装
-    ```
-
-3. 运行：
-
-    ```bash
-    export PADDLE_API_TOKEN='你的api_token'
-    python pdf2epub_paddle.py /path/to/your/book.pdf
-    ```
-
-## 配置项
-
-- **Chunk Size (分块大小)**：默认为每块 5 页，以确保稳定性。如果你的网络连接稳定且额度较高，可以在脚本中修改 `CHUNK_SIZE`。
-- **Timeout (超时时间)**：默认请求超时时间为 180 秒。
+```bash
+sudo ln -s "$(pwd)/epub" /usr/local/bin/epub
+epub /path/to/your/book.pdf
+```
 
 ## 开源协议
 
